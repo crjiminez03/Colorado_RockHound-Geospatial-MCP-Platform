@@ -99,23 +99,14 @@ def find_vacant_claims_near_mineral(mineral_name: str, max_distance_miles: float
 
 @mcp.tool()
 def check_land_access(latitude: float, longitude: float, mineral_search_radius_miles: float = 2.0) -> str:
-    """Check land ownership, claim status, county, nearest city, documented
-    minerals, and nearby hot springs at a given coordinate -- a complete
-    site report before heading out.
+    """Check land ownership, claim status, county, nearest city, nearest named
+    river, documented minerals, and nearby hot springs at a given coordinate --
+    a complete site report before heading out.
 
-    Note: hot springs are geologically related to mineral-rich water --
-    surfacing them alongside documented mineral occurrences gives a more
-    complete geological picture of an area. Hot springs are much rarer
-    than mineral occurrence points (93 statewide vs. ~17,669 minerals), so
-    "none found" within the search radius is a normal, accurate result for
-    most locations, not a data gap.
-
-    Mineral dedup note: commodity_type stores comma-separated mineral lists
-    per site record (e.g. "Beryllium, Tantalum"). Deduplicating on the whole
-    string still allowed the same individual mineral to appear multiple
-    times if it showed up in different multi-mineral records. Fixed by
-    splitting each record's commodity list into individual mineral names
-    before deduplicating.
+    Note: nearest river uses the same efficient pattern as nearest city (ORDER
+    BY STDistance with the spatial index) rather than a full radius scan, since
+    "how far to the nearest named river" is the useful question for placer
+    deposit potential -- not an exhaustive list of every river within X miles.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -131,7 +122,11 @@ def check_land_access(latitude: float, longitude: float, mineral_search_radius_m
             (SELECT TOP 1 city_name FROM Silver.Cities
              ORDER BY boundary.STDistance(@searchPoint)) AS nearest_city,
             (SELECT TOP 1 boundary.STDistance(@searchPoint) / 1609.34 FROM Silver.Cities
-             ORDER BY boundary.STDistance(@searchPoint)) AS nearest_city_distance_miles
+             ORDER BY boundary.STDistance(@searchPoint)) AS nearest_city_distance_miles,
+            (SELECT TOP 1 river_name FROM Silver.Rivers
+             ORDER BY path.STDistance(@searchPoint)) AS nearest_river,
+            (SELECT TOP 1 path.STDistance(@searchPoint) / 1609.34 FROM Silver.Rivers
+             ORDER BY path.STDistance(@searchPoint)) AS nearest_river_distance_miles
     """, latitude, longitude)
     row = cursor.fetchone()
 
@@ -165,6 +160,11 @@ def check_land_access(latitude: float, longitude: float, mineral_search_radius_m
         city_note = f"\nLocated within: {row.nearest_city}"
     else:
         city_note = f"\nNearest city: {row.nearest_city} ({row.nearest_city_distance_miles:.1f} mi away)" if row.nearest_city else ""
+
+    if row.nearest_river_distance_miles is not None and row.nearest_river_distance_miles < 0.1:
+        river_note = f"\nOn or adjacent to: {row.nearest_river}"
+    else:
+        river_note = f"\nNearest named river: {row.nearest_river} ({row.nearest_river_distance_miles:.1f} mi away)" if row.nearest_river else ""
 
     radius_meters = mineral_search_radius_miles * 1609.34
 
@@ -210,7 +210,7 @@ def check_land_access(latitude: float, longitude: float, mineral_search_radius_m
     else:
         springs_note = f"\nNo hot springs within {mineral_search_radius_miles} mi"
 
-    return f"Land type: {row.land_type}{claim_note}{county_note}{city_note}{minerals_note}{springs_note}"
+    return f"Land type: {row.land_type}{claim_note}{county_note}{city_note}{river_note}{minerals_note}{springs_note}"
 
 
 if __name__ == "__main__":
