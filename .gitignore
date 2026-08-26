@@ -1,0 +1,18 @@
+# Downloaded source data -- large, reproducible from the public sources listed in README, not meant to be version-controlled
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local connection/config files -- never commit real connection strings or secrets
+*.env
+config.local.*
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
