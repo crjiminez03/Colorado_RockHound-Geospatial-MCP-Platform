@@ -49,6 +49,7 @@ flowchart TD
 | US Census TIGER/Line — Counties | County boundaries (national file, Colorado-filtered) | 64 |
 | US Census TIGER/Line — Places | City/town/CDP boundaries, Colorado-specific | varies |
 | Colorado Geological Survey — Geothermal Map v3 (Hot Springs) | Hot spring locations, temperature, use type, geothermometer estimates | 93 (matches official published count) |
+| USGS National Hydrography Dataset (NHD) — NHDFlowline | Named rivers/streams, filtered to StreamRiver + ArtificialPath feature types | 125,495 segments (aggregates to real river-scale totals — see challenges below) |
 
 All source records carry `source_url` and `source_type` (e.g., "Government Agency") for full data lineage and provenance tracking — a governance pattern built in intentionally, not an afterthought.
 
@@ -109,7 +110,7 @@ Two governed tools, deliberately scoped rather than exposing raw SQL access to a
 Finds vacant/lapsed claims near documented historical occurrences of a given mineral, flagging which claims closed most recently (freshest opportunities), which county each falls in, and sorting by proximity. Results are capped (default 50) with a note when more exist, for both usability and performance reasons -- see the performance investigation in "Real Engineering Challenges Solved."
 
 **`check_land_access(latitude, longitude, mineral_search_radius_miles)`**
-Given a coordinate, returns a complete site report: land ownership type, every active mining claim covering that point (since any one active claim means "do not dig," and multiple claims commonly overlap in dense historic districts), a summarized vacant-claim count, the county, the nearest city and its distance, documented minerals within a configurable radius (deduplicated at the individual-mineral level, not the raw-record level), and any hot springs within that same radius -- since hot springs and mineral-rich water are geologically related.
+Given a coordinate, returns a complete site report: land ownership type, every active mining claim covering that point (since any one active claim means "do not dig," and multiple claims commonly overlap in dense historic districts), a summarized vacant-claim count, the county, the nearest city and its distance, the nearest named river and its distance (useful for placer-deposit potential), documented minerals within a configurable radius (deduplicated at the individual-mineral level, not the raw-record level), and any hot springs within that same radius -- since hot springs and mineral-rich water are geologically related.
 
 Both tools query only the curated Silver layer through fixed, parameterized queries — the AI never gets arbitrary database access, only these specific, safe, purpose-built answers.
 
@@ -141,6 +142,10 @@ This section exists because the debugging process is arguably the most represent
 
 11. **A field-level deduplication bug.** A "documented minerals nearby" feature deduplicated on entire comma-separated commodity strings (e.g. `"Beryllium, Tantalum"` vs. `"Tantalum, Beryllium, REE"`), so the same individual mineral could still appear multiple times in the output if it showed up across different multi-mineral site records -- correct SQL-level `DISTINCT`, wrong level of granularity. Fixed by splitting each record's commodity list into individual mineral names and deduplicating at that level instead, verified by confirming a real test location's mineral list dropped from 28 entries with visible repeats to 15 genuinely distinct minerals.
 
+12. **A silent WKT format incompatibility.** Line geometries exported by geopandas from this source (which includes an elevation/M-value dimension) were written as `LINESTRING Z (...)`, a WKT tag format SQL Server's `geography` parser does not recognize (`24142: Expected "(" at position 11. The input has "Z"`). Fixed by stripping the `Z` tag from the WKT string before parsing -- the underlying coordinate data is unaffected, only the malformed tag needed removal.
+
+13. **A wrong data-completeness assumption caught by aggregation, not a single test case.** Filtering NHDFlowline to `FType 460` (StreamRiver) seemed like the obvious way to isolate real rivers/streams from canals, ditches, and pipelines. Loading succeeded without error and returned a plausible-looking row count -- but grouping the loaded data by river name and summing length revealed every major Colorado river (Colorado River, South Platte, Arkansas River) had implausibly short total lengths (e.g. Colorado River: ~51 km, when its real length through the state is roughly 450-500 km), while minor named creeks correctly showed hundreds of kilometers. Root cause: NHD represents the wider stretches of major rivers (anywhere they're mapped as a polygon area rather than a simple line) using a separate `FType 558` (ArtificialPath) code for network connectivity, which the original filter excluded entirely. Including both FTypes brought every major river to a realistic total length. This is a good example of why a single successful test case (a small creek, correctly represented as FType 460 for its entire length) doesn't validate a filter for the whole dataset -- aggregate validation caught what a spot-check would have missed.
+
 ---
 
 ## Example Output
@@ -154,16 +159,17 @@ GAMBLE NO 1, Park County - 2.9 mi from documented Quartz
 SARAH K #45, Chaffee County - 4.6 mi from documented Quartz
 ...
 
-> check_land_access(latitude=38.7431, longitude=-106.1742, mineral_search_radius_miles=15)
+> check_land_access(latitude=38.7431, longitude=-106.1742, mineral_search_radius_miles=2.0)
 
 Land type: PRI
 County: Chaffee
 Nearest city: Buena Vista (4.7 mi away)
-Documented minerals within 15.0 mi: Beryllium, Bismuth, Clay, Cobalt, Construction, Copper, Dimension, Feldspar, Fluorine-Fluorite, Geothermal, Gold, Granite, Graphite, Iron, Kyanite
-Hot springs within 15.0 mi: Mt. Princeton Hot Springs (84.00°C, 0.7 mi), Cottonwood (62.00°C, 5.3 mi), Browns Canyon (27.00°C, 8.6 mi)
+Nearest named river: Merriam Creek (0.4 mi away)
+Documented minerals within 2.0 mi: Construction, Copper, Geothermal, Gold, Granite, Sand and Gravel, Silver
+Hot springs within 2.0 mi: Mt. Princeton Hot Springs (84.00°C, 0.7 mi)
 ```
 
-Note the cross-source validation in the second example: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C) -- two independently sourced government datasets agreeing on the same real-world geological feature, without any code written specifically to check for that agreement.
+Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place.
 
 ---
 
@@ -178,10 +184,12 @@ RockHound/
 │   ├── 03_spatial_indexes.sql        -- Spatial index creation
 │   ├── 04_example_queries.sql        -- Diagnostic + optimized query patterns
 │   ├── 05_cities_counties_schema_and_load.sql  -- County/city boundary layer
-│   └── 06_hot_springs_schema_and_load.sql      -- Hot springs layer (Phase 2)
+│   ├── 06_hot_springs_schema_and_load.sql      -- Hot springs layer (Phase 2)
+│   └── 07_rivers_schema_and_load.sql           -- Rivers layer (Phase 2)
 └── python/
     ├── load_bronze.py                -- Bronze ingestion (Colorado-filtered, fast bulk insert)
     ├── load_hot_springs.py           -- Hot springs loader (live REST API query, Phase 2)
+    ├── load_rivers.py                -- Rivers loader (NHD, Phase 2)
     └── rockhound_server.py           -- MCP server with governed tools
 ```
 
@@ -191,7 +199,7 @@ RockHound/
 
 - **Phase 2 (in progress):**
   - ✅ Hot springs (Colorado Geological Survey, live REST API) — done, integrated into `check_land_access`
-  - ⏳ Rivers/streams (USGS NHD, placer deposit potential) — data source confirmed, Colorado filtering not yet applied
+  - ✅ Rivers/streams (USGS NHD, placer deposit potential) — done, integrated into `check_land_access`
   - ⏳ Bedrock/geologic formation data (Macrostrat live API) — confirmed accessible, not yet scoped in detail
 - **Phase 3 (scoped, not yet built):** Trailhead/parking entry points, elevation data, and vehicle-specific road access matching (ground clearance / 4WD requirements vs. a specific vehicle profile).
 
