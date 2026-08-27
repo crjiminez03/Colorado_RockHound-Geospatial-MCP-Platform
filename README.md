@@ -115,10 +115,13 @@ A detailed breakdown of what was used for what, since the actual development env
 
 
 
-Five governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
+Six governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
 
-**`find_vacant_claims_near_mineral(mineral_name, max_distance_miles, max_results)`**
-Finds vacant/lapsed claims near documented historical occurrences of a given mineral, flagging which claims closed most recently (freshest opportunities), which county each falls in, and sorting by proximity. Results are capped (default 50) with a note when more exist, for both usability and performance reasons -- see the performance investigation in "Real Engineering Challenges Solved."
+**`find_vacant_claims_near_mineral(mineral_name, max_distance_miles, max_results, latitude, longitude, search_radius_miles)`**
+Finds vacant/lapsed claims near documented historical occurrences of a given mineral, flagging which claims closed most recently (freshest opportunities), which county each falls in, and sorting by proximity. Results are capped (default 50) with a note when more exist, for both usability and performance reasons -- see the performance investigation in "Real Engineering Challenges Solved." Optional latitude/longitude narrow the search to occurrences within search_radius_miles (default 2.0) of a specific point, rather than searching the entire state -- useful for "what can I find near my claim" rather than "where can I find this anywhere in Colorado."
+
+**`find_mineral_locations(mineral_name, latitude, longitude, radius_miles, max_results)`**
+A trip-planning tool: "where should I even start looking for X," grouped by nearest town and county, not a flat list of raw coordinates. Deliberately does not check claim availability -- pairs with `find_vacant_claims_near_mineral` or `check_land_access` as a natural next step once a promising area is identified. Works statewide by default, or narrows to a radius around a point if coordinates are given.
 
 **`check_land_access(latitude, longitude, mineral_search_radius_miles)`**
 Given a coordinate, returns a complete site report: land ownership type, every active mining claim covering that point (since any one active claim means "do not dig," and multiple claims commonly overlap in dense historic districts), a summarized vacant-claim count, the county, the nearest city and its distance, the nearest named river and its distance (useful for placer-deposit potential), the nearest trailhead and its distance, documented minerals within a configurable radius (deduplicated at the individual-mineral level, not the raw-record level), and any hot springs within that same radius -- since hot springs and mineral-rich water are geologically related.
@@ -132,7 +135,9 @@ Given a coordinate, queries the live Macrostrat API for bedrock/geologic formati
 **`get_elevation(latitude, longitude)`**
 Given a coordinate, queries the live Open-Elevation API for ground elevation, returned in both meters and feet.
 
-The first three tools (`find_vacant_claims_near_mineral`, `check_land_access`, `check_vehicle_access`) query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The last two (`get_bedrock_geology`, `get_elevation`) are the deliberate exception: both query live external APIs rather than local data, and are kept as separate, clearly-labeled tools so an external API's latency or availability can never affect the core governed local-data tools.
+**Gem-variety name translation, shared by both mineral-search tools:** MRDS is an economic-minerals database, not a gem-collector's database -- it records "Feldspar," not "Amazonite," and "Manganese," not "Rhodochrosite." A curated `GEM_VARIETY_TO_COMMODITY` mapping (confirmed against the real loaded data for entries like Amazonite/Feldspar and Rhodochrosite/Manganese) translates common collector names automatically, always telling the user when a translation happened. A second, separate `GEM_VARIETY_TO_COMMODITY_LOWER_CONFIDENCE` mapping covers additional Colorado classics (Rhodonite, Turquoise, Wulfenite, Chrysocolla, Apatite, Zircon) as educated geologic guesses, not individually confirmed against the data, and is worded differently in the output specifically to signal that lower certainty rather than implying the same confidence as a verified entry. Deliberately not exhaustive -- e.g. Topaz was left unmapped after genuinely conflicting reasoning about its likely parent commodity, rather than force a guess.
+
+The first four tools (`find_vacant_claims_near_mineral`, `find_mineral_locations`, `check_land_access`, `check_vehicle_access`) query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The last two (`get_bedrock_geology`, `get_elevation`) are the deliberate exception: both query live external APIs rather than local data, and are kept as separate, clearly-labeled tools so an external API's latency or availability can never affect the core governed local-data tools.
 
 ---
 
@@ -180,6 +185,14 @@ This section exists because the debugging process is arguably the most represent
 
 20. **A deliberate "honest uncertainty" design principle, verified against both of its own branches.** OpenStreetMap's difficulty-related tags (`surface`, `tracktype`, `4wd_only`, `smoothness`) are populated on only 5-29% of the 73,703 loaded track segments -- meaning most coordinate lookups will find a segment with no explicit difficulty rating at all. Rather than defaulting to "likely passable" for untagged segments (which would be a false, unearned assurance) or "unknown, proceed with extreme caution" for everything (which would make the tool useless whenever real hazard data *does* exist), `check_vehicle_access` explicitly distinguishes and reports three different states: a real, specific hazard flag; an honest "no data available"; and a genuine "no red flags in available tags." Verified all the way through by testing against two real coordinates that happened to hit untagged segments (confirming the honest fallback), then deliberately pulling a real coordinate directly from a known-tagged road (`Forrester Road`: `surface=unpaved`, `4wd_only=yes`, `smoothness=very_bad`) to confirm the actual hazard-flagging branch fires correctly too -- not just the easier-to-hit fallback case.
 
+21. **A silent wrong-column bug from a copy-pasted pattern.** A new trip-planning tool (`find_mineral_locations`) needed a nearest-city lookup and copied the pattern used elsewhere in the project, referencing `Silver.Cities`' spatial column as `location`. That table's actual spatial column is named `boundary`. Because SQL Server resolves unqualified column references by scope rather than raising an error for a genuinely missing column name, the reference silently fell back to a column named `location` that did exist one scope up (the query's own CTE) -- meaning every city was scored at distance zero from itself, and `TOP 1` returned an arbitrary row with no real geographic relationship to the actual search point. The query ran without error and returned syntactically valid, plausible-looking output (a real town, a real county) -- caught only by noticing the returned town (Cheraw, Otero County) was hundreds of miles from the Chaffee County coordinate actually searched. A good example of why a successful-looking result still needs a plausibility check, not just an error check.
+
+22. **A per-row correlated-subquery pattern recreating an already-solved performance problem.** `find_mineral_locations` enriched each of up to 500 capped raw occurrences with a nearest-city lookup and a county lookup via correlated scalar subqueries -- structurally the same anti-pattern already identified and fixed once before in `find_vacant_claims_near_mineral`'s county enrichment (challenge #10), just recreated in a new tool built independently later. Confirmed via real timeouts on statewide searches for common minerals (Moonstone, Galena, Amazonite/Feldspar). Fixed the same way as before: switching to `CROSS APPLY`/`OUTER APPLY` (the pattern already proven to reliably trigger spatial index usage) and further reducing the raw sample cap from 500 to 200. Worth noting as a real limitation of institutional knowledge within a single project -- a lesson learned and documented in one tool didn't automatically prevent the same mistake in a different tool built later, until it was hit again directly.
+
+23. **A Python typing subtlety that passed local syntax checks but failed at runtime.** Adding optional coordinate parameters to two tools used the pattern `latitude: float = None`, which is syntactically valid Python and looks correct at a glance. The MCP framework's argument validation, however, checks the type hint itself (`float`, meaning "must be a real number") rather than inferring nullability from the default value -- so any call omitting coordinates failed with a Pydantic validation error, even though `None` was the documented, intended default. Fixed by using `Optional[float]` instead of bare `float` for every parameter meant to be genuinely optional. A good reminder that a default value and a type hint are two separate contracts, and a strict validation layer will enforce the type hint literally.
+
+24. **A curated knowledge layer, deliberately split by confidence level rather than presented as uniformly authoritative.** MRDS records minerals by economic commodity name, not by the collector/gem-variety name a rockhound is likely to actually search for (confirmed directly: "Amazonite" appears nowhere in the dataset, only "Feldspar"; same pattern for Rhodochrosite/Manganese and Halite/Salt). Rather than leaving this as a silent gap or guessing uniformly across the board, a `GEM_VARIETY_TO_COMMODITY` mapping was built and split into two explicitly separate dictionaries: entries individually confirmed against the real data (or so mineralogically universal that no reasonable database would differ, e.g. Ruby/Sapphire as Corundum varieties), and a second `GEM_VARIETY_TO_COMMODITY_LOWER_CONFIDENCE` set of educated guesses based on standard economic geology reasoning but not individually verified (e.g. Wulfenite -> Molybdenum, reasoned from its chemical formula). Each dictionary produces different, honestly worded output, so a lower-confidence guess is never presented with the same certainty as a confirmed mapping. At least one genuinely plausible Colorado name (Topaz) was deliberately left unmapped after real, conflicting reasoning about its likely parent commodity, rather than forcing a guess purely for the sake of completeness.
+
 ---
 
 ## Example Output
@@ -214,6 +227,21 @@ Bedrock geology at this location (3 mapped unit(s), from overlapping source maps
 
 Elevation at this location: 2704 m (8871 ft)
 
+> find_mineral_locations(mineral_name="Rhodochrosite")
+
+Note: 'Rhodochrosite' is a variety/species of Manganese, which is the name MRDS actually
+records -- searched as 'Manganese' instead.
+Areas with documented Manganese occurrences (statewide (based on a sample of up to 200
+documented occurrences)), by nearest town:
+  - Leadville, Lake -- 64 occurrence(s) in this sample
+  - Leadville North, Lake -- 25 occurrence(s) in this sample
+  - Smeltertown, Chaffee -- 8 occurrence(s) in this sample
+  - Alma, Park -- 2 occurrence(s) in this sample
+  ...
+This shows WHERE Manganese has been documented, not claim availability -- use
+find_vacant_claims_near_mineral or check_land_access next to see the real claim situation
+in a promising area before visiting.
+
 > check_vehicle_access(latitude=40.942218, longitude=-106.001034)
 
 Nearest mapped track: Forrester Road (0.0 mi away)
@@ -221,7 +249,7 @@ Vehicle: 2020 Ford Escape (7.9" clearance, AWD, no low-range)
 LIKELY NOT SUITABLE for this vehicle: tagged 4wd_only='yes'; smoothness='very_bad'. This vehicle has no low-range transfer case.
 ```
 
-Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place. The vehicle-access example above was deliberately tested against a coordinate pulled directly from a known-tagged road (rather than an arbitrary point) specifically to confirm the hazard-flagging logic works, not just its "no data available" fallback.
+Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place. The vehicle-access example above was deliberately tested against a coordinate pulled directly from a known-tagged road (rather than an arbitrary point) specifically to confirm the hazard-flagging logic works, not just its "no data available" fallback. The Rhodochrosite example is a real-world check too: Alma, Park County correctly appears in the results, and Alma is genuinely the nearest town to the Sweet Home Mine, one of the most famous rhodochrosite localities in the world -- the gem-variety translation and the underlying spatial data agree with real, independently-known geology.
 
 ---
 
@@ -239,14 +267,17 @@ RockHound/
 │   ├── 06_hot_springs_schema_and_load.sql      -- Hot springs layer (Phase 2)
 │   ├── 07_rivers_schema_and_load.sql           -- Rivers layer (Phase 2)
 │   ├── 08_trailheads_schema_and_load.sql       -- Trailheads layer (Phase 3)
-│   └── 09_tracks_vehicle_access_schema_and_load.sql  -- Tracks + Dim_Vehicle (Phase 3)
+│   ├── 09_tracks_vehicle_access_schema_and_load.sql  -- Tracks + Dim_Vehicle (Phase 3)
+│   └── 10_mineral_name_verification_queries.sql -- Diagnostic queries for the gem-variety
+│                                                    name mapping and a real column-name bug
+│                                                    (reference only -- no new schema)
 └── python/
     ├── load_bronze.py                -- Bronze ingestion (Colorado-filtered, fast bulk insert)
     ├── load_hot_springs.py           -- Hot springs loader (live REST API query, Phase 2)
     ├── load_rivers.py                -- Rivers loader (NHD, Phase 2)
     ├── load_trailheads.py            -- Trailheads loader (OpenStreetMap/Overpass, Phase 3)
     ├── load_tracks.py                -- Tracks loader (OpenStreetMap/Overpass, Phase 3)
-    └── rockhound_server.py           -- MCP server with all 5 governed tools, including
+    └── rockhound_server.py           -- MCP server with all 6 governed tools, including
                                           get_bedrock_geology and get_elevation (no separate
                                           load script or SQL file for either -- both are
                                           queried live from their respective APIs on each
