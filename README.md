@@ -256,6 +256,23 @@ RockHound/
 
 ---
 
+## How to Run This
+
+**Prerequisites:** SQL Server Express, Python 3.10+, ODBC Driver 18 for SQL Server, and the packages in `requirements.txt` (`pip install -r requirements.txt`).
+
+**Note on ordering:** most sources here interleave a Python loader (which populates Bronze from a downloaded file or a live API) and a SQL file (which creates the schema and transforms Bronze into Silver) -- run them as pairs, in this order, not all the SQL files first or all the Python files first:
+
+1. **`sql/01_bronze_schema.sql`** -- creates the Bronze schema and tables (structure only, no data yet).
+2. **Download the Phase 1 source files** using the links in "Real Data Sources" above (BLM claims, BLM land ownership, USGS MRDS, Census Counties/Places) into a local `data/` folder.
+3. **`python/load_bronze.py`** -- populates Bronze with claims, land ownership, mineral occurrences, counties, and cities from those downloaded files.
+4. **`sql/02_silver_schema_and_transform.sql`**, then **`sql/03_spatial_indexes.sql`**, then **`sql/05_cities_counties_schema_and_load.sql`** -- creates Silver and transforms the Phase 1 data (counties/cities Silver logic lives in `05`, not `02`).
+5. For each Phase 2/3 source, run its Python loader, then its matching numbered SQL file, in this order: **hot springs** (`load_hot_springs.py` -> `06_...sql`, no download needed, queries a live REST API), **rivers** (download NHDFlowline first -> `load_rivers.py` -> `07_...sql`), **trailheads** (Overpass Turbo export first -> `load_trailheads.py` -> `08_...sql`), **tracks** (Overpass Turbo export first -> `load_tracks.py` -> `09_...sql`, which also creates and populates `Dim_Vehicle`).
+6. **`sql/04_example_queries.sql`** is diagnostic/reference only -- not required to run the platform, but useful for seeing the real before/after of the CROSS APPLY performance fix.
+7. **`python/rockhound_server.py`** -- starts the MCP server (`python rockhound_server.py`), listening on `http://127.0.0.1:8000/mcp`.
+8. **Verify with the official MCP Inspector** (`npx @modelcontextprotocol/inspector`), pointed at the running server -- this is the same tool used to test and verify every result documented in this README.
+
+---
+
 ## Roadmap
 
 - **✅ Phase 1 (complete):** Core platform — mining claims, land ownership, mineral occurrences, counties, and cities. Full Bronze/Silver Medallion Architecture, spatial indexing, and the two foundational governed MCP tools (`find_vacant_claims_near_mineral`, `check_land_access`). See "Real Engineering Challenges Solved" #1-9 for the real bugs found and fixed here.
@@ -269,6 +286,19 @@ RockHound/
   - ✅ Vehicle-specific road access matching (OpenStreetMap track/road tags vs. a real vehicle profile in `Dim_Vehicle`) — done, as a separate `check_vehicle_access` tool
 
 All three original planning phases are now complete. Five governed MCP tools, real data end to end, verified against real ground-truth coordinates throughout.
+
+---
+
+## Known Limitations
+
+Several honest caveats are already noted individually throughout this README (in tool docstrings and specific challenge write-ups) -- collected here in one place:
+
+- **This is a snapshot, not a live sync.** Every dataset was downloaded or queried on a specific date and loaded once. Claim status, land ownership, and similar facts can change in the real world after that point. `get_bedrock_geology` and `get_elevation` are the only two tools that query genuinely live data on every call; everything else reflects the data as of when it was loaded.
+- **OpenStreetMap-sourced layers (trailheads, tracks) have partial, crowdsourced tag coverage.** Most track segments (71-95%, depending on the specific tag) have no explicit surface/difficulty rating at all, and some entries are auto-imported from Census TIGER data and were never manually verified by a human OSM mapper. `check_vehicle_access` is explicitly designed to report this honestly rather than guess.
+- **`Dim_Vehicle` currently has one real vehicle profile** (a 2020 Ford Escape), not a general vehicle database -- the schema supports adding more profiles, but only one is populated.
+- **This platform is scoped to Colorado only**, by design (every bounding-box filter, every data source, every sanity check assumes Colorado). Extending to another state would mean re-validating each source's actual coverage and quirks from scratch, not just changing a bounding box.
+- **No automated test suite.** Every tool and data-loading step in this project was verified through manual, interactive testing against known real-world ground truth (documented throughout "Real Engineering Challenges Solved" and "Example Output") rather than a formal unit/integration test framework.
+- **Advisory only, not a legal or safety authority.** `check_land_access` and `check_vehicle_access` in particular are meant to inform a decision, not replace verifying claim status, land access, and road conditions independently and in person before relying on them.
 
 ---
 
