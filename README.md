@@ -41,16 +41,17 @@ flowchart TD
 
 | Source | What it provides | Records (Colorado, filtered) |
 |---|---|---|
-| BLM MLRS Mining Claims — Not Closed | Active mining claims | 14,699 |
-| BLM MLRS Mining Claims — Closed (full history) | Historical/vacant claims | 288,158 |
-| BLM MLRS Mining Claims — Closed (last year) | Recency flag source | 1,165 |
-| BLM Colorado Surface Management Agency | Land ownership (BLM, USFS, private, tribal, etc.) | 21,175 |
-| USGS Mineral Resources Data System (MRDS) | Historical documented mineral occurrences | 17,669 |
-| US Census TIGER/Line — Counties | County boundaries (national file, Colorado-filtered) | 64 |
-| US Census TIGER/Line — Places | City/town/CDP boundaries, Colorado-specific | varies |
-| Colorado Geological Survey — Geothermal Map v3 (Hot Springs) | Hot spring locations, temperature, use type, geothermometer estimates | 93 (matches official published count) |
-| USGS National Hydrography Dataset (NHD) — NHDFlowline | Named rivers/streams, filtered to StreamRiver + ArtificialPath feature types | 125,495 segments (aggregates to real river-scale totals — see challenges below) |
-| Macrostrat (macrostrat.org) — Geologic Units API | Bedrock/geologic formation data, lithology, geologic age | Queried live per-coordinate, not bulk-loaded (see "Tech Stack" note) |
+| [BLM National GIS Hub](https://gbp-blm-egis.hub.arcgis.com/) — MLRS Mining Claims, Not Closed | Active mining claims | 14,699 |
+| [BLM National GIS Hub](https://gbp-blm-egis.hub.arcgis.com/) — MLRS Mining Claims, Closed (full history) | Historical/vacant claims | 288,158 |
+| [BLM National GIS Hub](https://gbp-blm-egis.hub.arcgis.com/) — MLRS Mining Claims, Closed (last year) | Recency flag source | 1,165 |
+| [BLM Colorado GIS Data Portal](https://www.blm.gov/site-page/services-geospatial-gis-data-colorado) — Surface Management Agency | Land ownership (BLM, USFS, private, tribal, etc.) | 21,175 |
+| [USGS Mineral Resources Data System (MRDS)](https://mrdata.usgs.gov/mrds/) | Historical documented mineral occurrences | 17,669 |
+| [US Census TIGER/Line — Counties](https://catalog.data.gov/dataset/tiger-line-shapefile-current-nation-u-s-county-and-equivalent-entities) | County boundaries (national file, Colorado-filtered) | 64 |
+| [US Census TIGER/Line — Places](https://catalog.data.gov/dataset/tiger-line-shapefile-current-state-colorado-place) | City/town/CDP boundaries, Colorado-specific | varies |
+| [Colorado Geological Survey — Geothermal Map v3](https://coloradogeologicalsurvey.org/geology/gis-data-map-portal/) (Hot Springs) | Hot spring locations, temperature, use type, geothermometer estimates | 93 (matches official published count) |
+| [USGS National Hydrography Dataset (NHD)](https://apps.nationalmap.gov/downloader/) — NHDFlowline | Named rivers/streams, filtered to StreamRiver + ArtificialPath feature types | 125,495 segments (aggregates to real river-scale totals — see challenges below) |
+| [Macrostrat](https://macrostrat.org) — Geologic Units API | Bedrock/geologic formation data, lithology, geologic age | Queried live per-coordinate, not bulk-loaded (see "Tech Stack" note) |
+| [OpenStreetMap](https://www.openstreetmap.org) (via the [Overpass API](https://overpass-api.de/), tag [highway=trailhead](https://wiki.openstreetmap.org/wiki/Tag:highway%3Dtrailhead)) | Trailhead locations, operator, fee info | 552 (name populated on 85%, operator on 16%, fee on 8%) |
 
 All source records carry `source_url` and `source_type` (e.g., "Government Agency") for full data lineage and provenance tracking — a governance pattern built in intentionally, not an afterthought.
 
@@ -74,8 +75,13 @@ A detailed breakdown of what was used for what, since the actual development env
 | Source | Access Method | Use Case |
 |---|---|---|
 | [BLM Colorado GIS Data Portal](https://www.blm.gov/site-page/services-geospatial-gis-data-colorado) | Direct download (Shapefile/GeoJSON) | Colorado-specific Surface Management Agency (land ownership) data |
-| BLM National GIS Hub (ArcGIS Hub) | Direct download (GeoJSON / File Geodatabase) | Mining claims (Active, Closed, Closed-Last-Year) — note: these particular downloads turned out to be *national* scope despite being found via a Colorado-focused search, which is why the Colorado bounding-box filter exists in `load_bronze.py` |
+| [BLM National GIS Hub](https://gbp-blm-egis.hub.arcgis.com/) (ArcGIS Hub) | Direct download (GeoJSON / File Geodatabase) | Mining claims (Active, Closed, Closed-Last-Year) — note: these particular downloads turned out to be *national* scope despite being found via a Colorado-focused search, which is why the Colorado bounding-box filter exists in `load_bronze.py` |
 | [USGS MRDS](https://mrdata.usgs.gov/mrds/) | Direct download (CSV, "Flattened" format) | Historical mineral occurrence records — also nationwide by default, filtered to Colorado via the `state` column |
+| [US Census TIGER/Line Shapefiles](https://catalog.data.gov/dataset/tiger-line-shapefile-current-nation-u-s-county-and-equivalent-entities) | Direct download (Shapefile) | County boundaries (national file, filtered to Colorado via `STATEFP`) and Colorado-specific Places (cities/towns/CDPs) |
+| [Colorado Geological Survey GIS Data Portal](https://coloradogeologicalsurvey.org/geology/gis-data-map-portal/) | Live ArcGIS REST Feature Service query (found by browsing the agency's REST services directory, not exposed in the public web map's UI) | Hot spring locations, temperature, use type, geothermometer estimates |
+| [USGS National Map Downloader](https://apps.nationalmap.gov/downloader/) | Direct download (Shapefile, NHDFlowline feature class) | Named rivers/streams for placer-deposit proximity search |
+| [Macrostrat](https://macrostrat.org) | Live REST API query per-coordinate | Bedrock/geologic formation data, lithology, geologic age |
+| [Overpass Turbo](https://overpass-turbo.eu/) (OpenStreetMap query tool) | One-time bulk GeoJSON export via Overpass QL query, tag `highway=trailhead` | Trailhead locations across Colorado |
 
 ### Database & Query Development
 | Tool | Use Case |
@@ -111,7 +117,7 @@ Three governed tools, deliberately scoped rather than exposing raw SQL access to
 Finds vacant/lapsed claims near documented historical occurrences of a given mineral, flagging which claims closed most recently (freshest opportunities), which county each falls in, and sorting by proximity. Results are capped (default 50) with a note when more exist, for both usability and performance reasons -- see the performance investigation in "Real Engineering Challenges Solved."
 
 **`check_land_access(latitude, longitude, mineral_search_radius_miles)`**
-Given a coordinate, returns a complete site report: land ownership type, every active mining claim covering that point (since any one active claim means "do not dig," and multiple claims commonly overlap in dense historic districts), a summarized vacant-claim count, the county, the nearest city and its distance, the nearest named river and its distance (useful for placer-deposit potential), documented minerals within a configurable radius (deduplicated at the individual-mineral level, not the raw-record level), and any hot springs within that same radius -- since hot springs and mineral-rich water are geologically related.
+Given a coordinate, returns a complete site report: land ownership type, every active mining claim covering that point (since any one active claim means "do not dig," and multiple claims commonly overlap in dense historic districts), a summarized vacant-claim count, the county, the nearest city and its distance, the nearest named river and its distance (useful for placer-deposit potential), the nearest trailhead and its distance, documented minerals within a configurable radius (deduplicated at the individual-mineral level, not the raw-record level), and any hot springs within that same radius -- since hot springs and mineral-rich water are geologically related.
 
 **`get_bedrock_geology(latitude, longitude)`**
 Given a coordinate, queries the live Macrostrat API for bedrock/geologic formation data at that point -- rock unit name, lithology, and geologic age. Unlike the other two tools, this queries an external live API on each call rather than the local Silver layer, since bedrock data is naturally point-queried rather than bulk-loadable in a way that fits the Bronze/Silver pattern. Deduplicates by (unit name, lithology) since multiple overlapping source maps at different scales commonly cover the same coordinate.
@@ -154,6 +160,10 @@ This section exists because the debugging process is arguably the most represent
 
 15. **A deliberate architectural boundary between governed local data and live external data.** Bedrock geology data doesn't fit the Bronze/Silver bulk-load pattern used everywhere else in this project -- Macrostrat is naturally point-queried rather than bulk-downloadable in a useful way. Rather than forcing it into the existing pattern or, alternatively, folding it into `check_land_access` for convenience, it was built as a separate, isolated tool (`get_bedrock_geology`) that queries the live API directly. This keeps the core governed tools (backed entirely by curated local data) free of external-API latency and availability risk, while still surfacing genuinely useful bedrock context through a clearly separate, clearly-labeled tool.
 
+16. **Realistic field-coverage assessment before overselling a data source (Phase 3).** OpenStreetMap's `highway=trailhead` tag set includes fields (`ele`, `4wd_only`, `access`, `motor_vehicle`) that looked like they might partially satisfy two other planned Phase 3 goals (elevation and vehicle-access matching) for free. Checking actual coverage across all 552 real Colorado trailheads showed these fields populated on fewer than 5% of records -- not a real dataset, just scattered examples. Only `name` (85%), `operator` (16%), and `fee` (8%) had meaningful, usable coverage. Caught before building anything on the assumption that "the field exists" meant "the field is usable" -- Phase 3's elevation and vehicle-access work still needed their own dedicated sources.
+
+17. **A silent Phase 1 data-quality bug surfaced two phases later.** A `check_land_access` result unexpectedly included `"nan"` in its documented-minerals list, alongside real mineral names like Gold and Silver -- plausible enough at a glance to almost pass as legitimate. Root cause: the original Phase 1 loader (`load_bronze.py`) used pandas, which represents missing numeric-like values as `NaN`; when cast to a Python string during insertion, this became the literal text `"nan"` rather than a true NULL, and was stored as if it were a real commodity value. Affected 1,564 rows, undetected through all of Phase 1 and most of Phase 2. Confirmed via `COUNT(*)` (1,564 exact matches) and ruled out messier mixed-string cases (a `LIKE '%nan%'` check after the fix returned zero rows) before concluding a single `UPDATE` had resolved it completely. Fixed at the Silver data layer (converted to true `NULL`) rather than patched at the application/tool level, so every future query against the table is covered automatically.
+
 ---
 
 ## Example Output
@@ -167,14 +177,15 @@ GAMBLE NO 1, Park County - 2.9 mi from documented Quartz
 SARAH K #45, Chaffee County - 4.6 mi from documented Quartz
 ...
 
-> check_land_access(latitude=38.7431, longitude=-106.1742, mineral_search_radius_miles=2.0)
+> check_land_access(latitude=38.7431, longitude=-106.1742, mineral_search_radius_miles=5.0)
 
 Land type: PRI
 County: Chaffee
 Nearest city: Buena Vista (4.7 mi away)
 Nearest named river: Merriam Creek (0.4 mi away)
-Documented minerals within 2.0 mi: Construction, Copper, Geothermal, Gold, Granite, Sand and Gravel, Silver
-Hot springs within 2.0 mi: Mt. Princeton Hot Springs (84.00°C, 0.7 mi)
+Nearest trailhead: Wagon Loop Trail (5.1 mi away)
+Documented minerals within 5.0 mi: Construction, Copper, Geothermal, Gold, Granite, Sand and Gravel, Silver
+Hot springs within 5.0 mi: Mt. Princeton Hot Springs (84.00°C, 0.7 mi)
 
 > get_bedrock_geology(latitude=39.5, longitude=-105.7)
 
@@ -200,11 +211,13 @@ RockHound/
 │   ├── 04_example_queries.sql        -- Diagnostic + optimized query patterns
 │   ├── 05_cities_counties_schema_and_load.sql  -- County/city boundary layer
 │   ├── 06_hot_springs_schema_and_load.sql      -- Hot springs layer (Phase 2)
-│   └── 07_rivers_schema_and_load.sql           -- Rivers layer (Phase 2)
+│   ├── 07_rivers_schema_and_load.sql           -- Rivers layer (Phase 2)
+│   └── 08_trailheads_schema_and_load.sql       -- Trailheads layer (Phase 3)
 └── python/
     ├── load_bronze.py                -- Bronze ingestion (Colorado-filtered, fast bulk insert)
     ├── load_hot_springs.py           -- Hot springs loader (live REST API query, Phase 2)
     ├── load_rivers.py                -- Rivers loader (NHD, Phase 2)
+    ├── load_trailheads.py            -- Trailheads loader (OpenStreetMap/Overpass, Phase 3)
     └── rockhound_server.py           -- MCP server with governed tools, including get_bedrock_geology
                                           (no separate load script or SQL file -- bedrock geology is
                                           queried live from Macrostrat's API on each tool call, not
@@ -215,11 +228,15 @@ RockHound/
 
 ## Roadmap
 
+- **✅ Phase 1 (complete):** Core platform — mining claims, land ownership, mineral occurrences, counties, and cities. Full Bronze/Silver Medallion Architecture, spatial indexing, and the two foundational governed MCP tools (`find_vacant_claims_near_mineral`, `check_land_access`). See "Real Engineering Challenges Solved" #1-9 for the real bugs found and fixed here.
 - **✅ Phase 2 (complete):**
   - ✅ Hot springs (Colorado Geological Survey, live REST API) — done, integrated into `check_land_access`
   - ✅ Rivers/streams (USGS NHD, placer deposit potential) — done, integrated into `check_land_access`
   - ✅ Bedrock/geologic formation data (Macrostrat live API) — done, as a separate `get_bedrock_geology` tool
-- **Phase 3 (scoped, not yet built):** Trailhead/parking entry points (OpenStreetMap via Overpass API), elevation data (Open-Elevation API or USGS 3DEP), and vehicle-specific road access matching (ground clearance / 4WD requirements vs. a specific vehicle profile).
+- **Phase 3 (in progress):**
+  - ✅ Trailheads (OpenStreetMap via Overpass API) — done, integrated into `check_land_access`
+  - ⏳ Elevation data (Open-Elevation API or USGS 3DEP) — not yet built
+  - ⏳ Vehicle-specific road access matching (ground clearance / 4WD requirements vs. a specific vehicle profile) — not yet built
 
 ---
 
