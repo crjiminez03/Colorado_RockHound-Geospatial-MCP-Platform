@@ -1,9 +1,10 @@
 """
 RockHound MCP Server
 
-Exposes two governed, purpose-built tools over Streamable HTTP -- the AI
+Exposes governed, purpose-built tools over Streamable HTTP -- the AI
 client never gets raw SQL access, only these specific, parameterized,
-pre-approved queries against the curated Silver layer.
+pre-approved queries against the curated Silver layer (or, for bedrock
+geology, a live external API call).
 
 Run with: python rockhound_server.py
 Server listens on http://127.0.0.1:8000/mcp
@@ -18,6 +19,7 @@ Inspector (`npx @modelcontextprotocol/inspector`).
 
 from mcp.server import MCPServer
 import pyodbc
+import requests
 
 mcp = MCPServer("RockHound")
 
@@ -107,6 +109,16 @@ def check_land_access(latitude: float, longitude: float, mineral_search_radius_m
     BY STDistance with the spatial index) rather than a full radius scan, since
     "how far to the nearest named river" is the useful question for placer
     deposit potential -- not an exhaustive list of every river within X miles.
+
+    Note: hot springs and minerals use a radius scan (mineral_search_radius_miles)
+    since those are sparse enough that "everything nearby" is more useful than
+    "just the closest one."
+
+    Mineral dedup note: commodity_type stores comma-separated mineral lists
+    per site record. Deduplicating on the whole string still allowed the same
+    individual mineral to appear multiple times if it showed up in different
+    multi-mineral records. Fixed by splitting each record's commodity list
+    into individual mineral names before deduplicating.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -211,6 +223,56 @@ def check_land_access(latitude: float, longitude: float, mineral_search_radius_m
         springs_note = f"\nNo hot springs within {mineral_search_radius_miles} mi"
 
     return f"Land type: {row.land_type}{claim_note}{county_note}{city_note}{river_note}{minerals_note}{springs_note}"
+
+
+@mcp.tool()
+def get_bedrock_geology(latitude: float, longitude: float) -> str:
+    """Look up bedrock/geologic formation information at a coordinate via the
+    live Macrostrat API (macrostrat.org) -- a community geologic database.
+
+    Unlike every other tool in this server, this queries an external live
+    API on each call rather than the local governed Silver layer, since
+    Macrostrat's data is naturally point-queried rather than bulk-loadable
+    in a way that fits the Bronze/Silver pattern. Kept as a separate tool
+    (not folded into check_land_access) to avoid adding external-API
+    latency/failure risk to the core local-data tool.
+
+    Note: multiple overlapping geologic map results are common and expected
+    -- Macrostrat aggregates maps from many source datasets at different
+    scales/resolutions that can genuinely overlap the same coordinate.
+    Results are deduplicated by (rock unit name, lithology) pair.
+    """
+    url = f"https://macrostrat.org/api/v2/geologic_units/map?lat={latitude}&lng={longitude}&format=geojson"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as e:
+        return f"Could not reach Macrostrat API: {e}"
+
+    features = payload.get("success", {}).get("data", {}).get("features", [])
+    if not features:
+        return "No bedrock geology data available from Macrostrat for this location."
+
+    seen = set()
+    units = []
+    for feature in features:
+        props = feature.get("properties", {})
+        name = props.get("name", "Unknown unit")
+        lith = props.get("lith", "")
+        age = props.get("best_int_name") or props.get("t_int_name", "")
+        key = (name, lith)
+        if key in seen:
+            continue
+        seen.add(key)
+        units.append((name, lith, age))
+
+    lines = [f"Bedrock geology at this location ({len(units)} mapped unit(s), from overlapping source maps at different scales):"]
+    for name, lith, age in units:
+        lith_note = f" -- lithology: {lith}" if lith else ""
+        age_note = f" ({age})" if age else ""
+        lines.append(f"  - {name}{age_note}{lith_note}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
