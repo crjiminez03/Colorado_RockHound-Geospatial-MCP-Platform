@@ -52,6 +52,8 @@ flowchart TD
 | [USGS National Hydrography Dataset (NHD)](https://apps.nationalmap.gov/downloader/) — NHDFlowline | Named rivers/streams, filtered to StreamRiver + ArtificialPath feature types | 125,495 segments (aggregates to real river-scale totals — see challenges below) |
 | [Macrostrat](https://macrostrat.org) — Geologic Units API | Bedrock/geologic formation data, lithology, geologic age | Queried live per-coordinate, not bulk-loaded (see "Tech Stack" note) |
 | [OpenStreetMap](https://www.openstreetmap.org) (via the [Overpass API](https://overpass-api.de/), tag [highway=trailhead](https://wiki.openstreetmap.org/wiki/Tag:highway%3Dtrailhead)) | Trailhead locations, operator, fee info | 552 (name populated on 85%, operator on 16%, fee on 8%) |
+| [Open-Elevation](https://open-elevation.com) (API) | Ground elevation at a coordinate, in meters | Queried live per-coordinate, not bulk-loaded |
+| [OpenStreetMap](https://www.openstreetmap.org) (via the [Overpass API](https://overpass-api.de/), tag [highway=track](https://wiki.openstreetmap.org/wiki/Tag:highway%3Dtrack)) | Track/dirt road locations, surface, tracktype, 4wd_only, smoothness — for vehicle-access matching | 73,703 (surface populated on 29%, tracktype on 16%, 4wd_only on 5%, smoothness on 10%) |
 
 All source records carry `source_url` and `source_type` (e.g., "Government Agency") for full data lineage and provenance tracking — a governance pattern built in intentionally, not an afterthought.
 
@@ -82,6 +84,8 @@ A detailed breakdown of what was used for what, since the actual development env
 | [USGS National Map Downloader](https://apps.nationalmap.gov/downloader/) | Direct download (Shapefile, NHDFlowline feature class) | Named rivers/streams for placer-deposit proximity search |
 | [Macrostrat](https://macrostrat.org) | Live REST API query per-coordinate | Bedrock/geologic formation data, lithology, geologic age |
 | [Overpass Turbo](https://overpass-turbo.eu/) (OpenStreetMap query tool) | One-time bulk GeoJSON export via Overpass QL query, tag `highway=trailhead` | Trailhead locations across Colorado |
+| [Open-Elevation](https://open-elevation.com) | Live REST API query per-coordinate | Ground elevation lookup |
+| [Overpass Turbo](https://overpass-turbo.eu/) (OpenStreetMap query tool) | One-time bulk GeoJSON export via Overpass QL query, tag `highway=track` | Track/dirt road segments for vehicle-access matching (73,703 records — see "Real Engineering Challenges Solved" for the scale/coverage checks done before committing to this bulk-load approach) |
 
 ### Database & Query Development
 | Tool | Use Case |
@@ -111,7 +115,7 @@ A detailed breakdown of what was used for what, since the actual development env
 
 
 
-Three governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
+Five governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
 
 **`find_vacant_claims_near_mineral(mineral_name, max_distance_miles, max_results)`**
 Finds vacant/lapsed claims near documented historical occurrences of a given mineral, flagging which claims closed most recently (freshest opportunities), which county each falls in, and sorting by proximity. Results are capped (default 50) with a note when more exist, for both usability and performance reasons -- see the performance investigation in "Real Engineering Challenges Solved."
@@ -119,10 +123,16 @@ Finds vacant/lapsed claims near documented historical occurrences of a given min
 **`check_land_access(latitude, longitude, mineral_search_radius_miles)`**
 Given a coordinate, returns a complete site report: land ownership type, every active mining claim covering that point (since any one active claim means "do not dig," and multiple claims commonly overlap in dense historic districts), a summarized vacant-claim count, the county, the nearest city and its distance, the nearest named river and its distance (useful for placer-deposit potential), the nearest trailhead and its distance, documented minerals within a configurable radius (deduplicated at the individual-mineral level, not the raw-record level), and any hot springs within that same radius -- since hot springs and mineral-rich water are geologically related.
 
-**`get_bedrock_geology(latitude, longitude)`**
-Given a coordinate, queries the live Macrostrat API for bedrock/geologic formation data at that point -- rock unit name, lithology, and geologic age. Unlike the other two tools, this queries an external live API on each call rather than the local Silver layer, since bedrock data is naturally point-queried rather than bulk-loadable in a way that fits the Bronze/Silver pattern. Deduplicates by (unit name, lithology) since multiple overlapping source maps at different scales commonly cover the same coordinate.
+**`check_vehicle_access(latitude, longitude, vehicle_name)`**
+Given a coordinate and a vehicle profile (from a small `Dim_Vehicle` reference table, currently populated with a real 2020 Ford Escape: 7.9" clearance, AWD, no low-range), finds the nearest mapped track/road and evaluates its OpenStreetMap surface/difficulty tags against that vehicle's real capabilities. Honestly reports "no difficulty data available" when a segment isn't tagged (the majority case), rather than assuming a road is safe by default -- verified against both a real untagged segment and a real known-hazardous one (`4wd_only=yes`, `smoothness=very_bad`) to confirm both branches of the logic actually work, not just the fallback.
 
-The first two tools query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The bedrock tool is the one exception, deliberately isolated so an external API's latency or availability can't affect the core governed local-data tools.
+**`get_bedrock_geology(latitude, longitude)`**
+Given a coordinate, queries the live Macrostrat API for bedrock/geologic formation data at that point -- rock unit name, lithology, and geologic age. Deduplicates by (unit name, lithology) since multiple overlapping source maps at different scales commonly cover the same coordinate.
+
+**`get_elevation(latitude, longitude)`**
+Given a coordinate, queries the live Open-Elevation API for ground elevation, returned in both meters and feet.
+
+The first three tools (`find_vacant_claims_near_mineral`, `check_land_access`, `check_vehicle_access`) query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The last two (`get_bedrock_geology`, `get_elevation`) are the deliberate exception: both query live external APIs rather than local data, and are kept as separate, clearly-labeled tools so an external API's latency or availability can never affect the core governed local-data tools.
 
 ---
 
@@ -164,6 +174,12 @@ This section exists because the debugging process is arguably the most represent
 
 17. **A silent Phase 1 data-quality bug surfaced two phases later.** A `check_land_access` result unexpectedly included `"nan"` in its documented-minerals list, alongside real mineral names like Gold and Silver -- plausible enough at a glance to almost pass as legitimate. Root cause: the original Phase 1 loader (`load_bronze.py`) used pandas, which represents missing numeric-like values as `NaN`; when cast to a Python string during insertion, this became the literal text `"nan"` rather than a true NULL, and was stored as if it were a real commodity value. Affected 1,564 rows, undetected through all of Phase 1 and most of Phase 2. Confirmed via `COUNT(*)` (1,564 exact matches) and ruled out messier mixed-string cases (a `LIKE '%nan%'` check after the fix returned zero rows) before concluding a single `UPDATE` had resolved it completely. Fixed at the Silver data layer (converted to true `NULL`) rather than patched at the application/tool level, so every future query against the table is covered automatically.
 
+18. **The same caching/URL-matching quirk from challenge #14, recurring with a different API.** Before writing the elevation tool, an initial test fetch of the Open-Elevation API appeared to succeed -- valid JSON, a real-looking elevation value -- but the returned coordinates (41.16, -8.58, in Portugal) were the literal example coordinate from that API's own documentation page, not the Colorado coordinate actually requested. Caught immediately this time, faster than the first occurrence, specifically *because* it had already been documented as a known failure mode earlier in the project. Re-verified by having the real URL tested directly and independently, which returned a correct, plausible Colorado elevation (2,704 m at a known test coordinate). A good demonstration of why documenting a lesson (not just fixing the immediate instance) pays off the next time the same failure mode shows up somewhere new.
+
+19. **Two rounds of the same column-width bug, one layer apart.** Loading real OpenStreetMap track/road tag data (`highway=track`, 73,703 segments) hit a `String data, right truncation` error on `tracktype` at the Bronze layer -- an initial `VARCHAR(20)` was too narrow for real crowdsourced tag values (which aren't always the clean `grade1`-`grade5` format assumed). Widened the affected Bronze columns and reloaded successfully -- but the identical error then recurred one layer downstream, in Silver, which still had the original narrower column definitions inherited from the initial schema design. A reminder that a fix applied to one layer of a Bronze/Silver pipeline doesn't automatically propagate to the next; both layers needed the same correction applied separately.
+
+20. **A deliberate "honest uncertainty" design principle, verified against both of its own branches.** OpenStreetMap's difficulty-related tags (`surface`, `tracktype`, `4wd_only`, `smoothness`) are populated on only 5-29% of the 73,703 loaded track segments -- meaning most coordinate lookups will find a segment with no explicit difficulty rating at all. Rather than defaulting to "likely passable" for untagged segments (which would be a false, unearned assurance) or "unknown, proceed with extreme caution" for everything (which would make the tool useless whenever real hazard data *does* exist), `check_vehicle_access` explicitly distinguishes and reports three different states: a real, specific hazard flag; an honest "no data available"; and a genuine "no red flags in available tags." Verified all the way through by testing against two real coordinates that happened to hit untagged segments (confirming the honest fallback), then deliberately pulling a real coordinate directly from a known-tagged road (`Forrester Road`: `surface=unpaved`, `4wd_only=yes`, `smoothness=very_bad`) to confirm the actual hazard-flagging branch fires correctly too -- not just the easier-to-hit fallback case.
+
 ---
 
 ## Example Output
@@ -193,9 +209,19 @@ Bedrock geology at this location (3 mapped unit(s), from overlapping source maps
   - Paleoproterozoic metamorphic and undivided crystalline: sedimentary and volcanic gneiss (Paleoproterozoic) -- lithology: metamorphic and undivided crystalline: sedimentary and volcanic gneiss
   - Biotitic gneiss, schist, and migmatite (Paleoproterozoic) -- lithology: Major:{biotite gneiss,schist,migmatite}, Minor:{gneiss,calc silicate schist,marble}
   - Paleoproterozoic crystalline metamorphic rocks (Paleoproterozoic) -- lithology: orthogneiss/paragneiss
+
+> get_elevation(latitude=38.7431, longitude=-106.1742)
+
+Elevation at this location: 2704 m (8871 ft)
+
+> check_vehicle_access(latitude=40.942218, longitude=-106.001034)
+
+Nearest mapped track: Forrester Road (0.0 mi away)
+Vehicle: 2020 Ford Escape (7.9" clearance, AWD, no low-range)
+LIKELY NOT SUITABLE for this vehicle: tagged 4wd_only='yes'; smoothness='very_bad'. This vehicle has no low-range transfer case.
 ```
 
-Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place.
+Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place. The vehicle-access example above was deliberately tested against a coordinate pulled directly from a known-tagged road (rather than an arbitrary point) specifically to confirm the hazard-flagging logic works, not just its "no data available" fallback.
 
 ---
 
@@ -212,16 +238,20 @@ RockHound/
 │   ├── 05_cities_counties_schema_and_load.sql  -- County/city boundary layer
 │   ├── 06_hot_springs_schema_and_load.sql      -- Hot springs layer (Phase 2)
 │   ├── 07_rivers_schema_and_load.sql           -- Rivers layer (Phase 2)
-│   └── 08_trailheads_schema_and_load.sql       -- Trailheads layer (Phase 3)
+│   ├── 08_trailheads_schema_and_load.sql       -- Trailheads layer (Phase 3)
+│   └── 09_tracks_vehicle_access_schema_and_load.sql  -- Tracks + Dim_Vehicle (Phase 3)
 └── python/
     ├── load_bronze.py                -- Bronze ingestion (Colorado-filtered, fast bulk insert)
     ├── load_hot_springs.py           -- Hot springs loader (live REST API query, Phase 2)
     ├── load_rivers.py                -- Rivers loader (NHD, Phase 2)
     ├── load_trailheads.py            -- Trailheads loader (OpenStreetMap/Overpass, Phase 3)
-    └── rockhound_server.py           -- MCP server with governed tools, including get_bedrock_geology
-                                          (no separate load script or SQL file -- bedrock geology is
-                                          queried live from Macrostrat's API on each tool call, not
-                                          bulk-loaded, so there's no Bronze/Silver step for this source)
+    ├── load_tracks.py                -- Tracks loader (OpenStreetMap/Overpass, Phase 3)
+    └── rockhound_server.py           -- MCP server with all 5 governed tools, including
+                                          get_bedrock_geology and get_elevation (no separate
+                                          load script or SQL file for either -- both are
+                                          queried live from their respective APIs on each
+                                          tool call, not bulk-loaded, so there's no
+                                          Bronze/Silver step for either source)
 ```
 
 ---
@@ -233,10 +263,12 @@ RockHound/
   - ✅ Hot springs (Colorado Geological Survey, live REST API) — done, integrated into `check_land_access`
   - ✅ Rivers/streams (USGS NHD, placer deposit potential) — done, integrated into `check_land_access`
   - ✅ Bedrock/geologic formation data (Macrostrat live API) — done, as a separate `get_bedrock_geology` tool
-- **Phase 3 (in progress):**
+- **✅ Phase 3 (complete):**
   - ✅ Trailheads (OpenStreetMap via Overpass API) — done, integrated into `check_land_access`
-  - ⏳ Elevation data (Open-Elevation API or USGS 3DEP) — not yet built
-  - ⏳ Vehicle-specific road access matching (ground clearance / 4WD requirements vs. a specific vehicle profile) — not yet built
+  - ✅ Elevation data (Open-Elevation API) — done, as a separate `get_elevation` tool
+  - ✅ Vehicle-specific road access matching (OpenStreetMap track/road tags vs. a real vehicle profile in `Dim_Vehicle`) — done, as a separate `check_vehicle_access` tool
+
+All three original planning phases are now complete. Five governed MCP tools, real data end to end, verified against real ground-truth coordinates throughout.
 
 ---
 
