@@ -3,3 +3,4 @@ pandas
 pyodbc
 shapely
 mcp
+requests
