@@ -102,13 +102,13 @@ def find_vacant_claims_near_mineral(mineral_name: str, max_distance_miles: float
 @mcp.tool()
 def check_land_access(latitude: float, longitude: float, mineral_search_radius_miles: float = 2.0) -> str:
     """Check land ownership, claim status, county, nearest city, nearest named
-    river, documented minerals, and nearby hot springs at a given coordinate --
-    a complete site report before heading out.
+    river, nearest trailhead, documented minerals, and nearby hot springs at a
+    given coordinate -- a complete site report before heading out.
 
-    Note: nearest river uses the same efficient pattern as nearest city (ORDER
-    BY STDistance with the spatial index) rather than a full radius scan, since
-    "how far to the nearest named river" is the useful question for placer
-    deposit potential -- not an exhaustive list of every river within X miles.
+    Note: nearest river and nearest trailhead use the same efficient pattern
+    as nearest city (ORDER BY STDistance with the spatial index) rather than
+    a full radius scan, since "how far to the nearest one" is the useful
+    question -- not an exhaustive list of every one within X miles.
 
     Note: hot springs and minerals use a radius scan (mineral_search_radius_miles)
     since those are sparse enough that "everything nearby" is more useful than
@@ -138,7 +138,11 @@ def check_land_access(latitude: float, longitude: float, mineral_search_radius_m
             (SELECT TOP 1 river_name FROM Silver.Rivers
              ORDER BY path.STDistance(@searchPoint)) AS nearest_river,
             (SELECT TOP 1 path.STDistance(@searchPoint) / 1609.34 FROM Silver.Rivers
-             ORDER BY path.STDistance(@searchPoint)) AS nearest_river_distance_miles
+             ORDER BY path.STDistance(@searchPoint)) AS nearest_river_distance_miles,
+            (SELECT TOP 1 trail_name FROM Silver.Trailheads
+             ORDER BY location.STDistance(@searchPoint)) AS nearest_trailhead,
+            (SELECT TOP 1 location.STDistance(@searchPoint) / 1609.34 FROM Silver.Trailheads
+             ORDER BY location.STDistance(@searchPoint)) AS nearest_trailhead_distance_miles
     """, latitude, longitude)
     row = cursor.fetchone()
 
@@ -177,6 +181,11 @@ def check_land_access(latitude: float, longitude: float, mineral_search_radius_m
         river_note = f"\nOn or adjacent to: {row.nearest_river}"
     else:
         river_note = f"\nNearest named river: {row.nearest_river} ({row.nearest_river_distance_miles:.1f} mi away)" if row.nearest_river else ""
+
+    if row.nearest_trailhead_distance_miles is not None and row.nearest_trailhead_distance_miles < 0.1:
+        trailhead_note = f"\nAt trailhead: {row.nearest_trailhead}"
+    else:
+        trailhead_note = f"\nNearest trailhead: {row.nearest_trailhead} ({row.nearest_trailhead_distance_miles:.1f} mi away)" if row.nearest_trailhead else ""
 
     radius_meters = mineral_search_radius_miles * 1609.34
 
@@ -222,7 +231,7 @@ def check_land_access(latitude: float, longitude: float, mineral_search_radius_m
     else:
         springs_note = f"\nNo hot springs within {mineral_search_radius_miles} mi"
 
-    return f"Land type: {row.land_type}{claim_note}{county_note}{city_note}{river_note}{minerals_note}{springs_note}"
+    return f"Land type: {row.land_type}{claim_note}{county_note}{city_note}{river_note}{trailhead_note}{minerals_note}{springs_note}"
 
 
 @mcp.tool()
