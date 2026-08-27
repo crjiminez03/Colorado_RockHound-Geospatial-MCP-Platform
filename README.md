@@ -50,6 +50,7 @@ flowchart TD
 | US Census TIGER/Line — Places | City/town/CDP boundaries, Colorado-specific | varies |
 | Colorado Geological Survey — Geothermal Map v3 (Hot Springs) | Hot spring locations, temperature, use type, geothermometer estimates | 93 (matches official published count) |
 | USGS National Hydrography Dataset (NHD) — NHDFlowline | Named rivers/streams, filtered to StreamRiver + ArtificialPath feature types | 125,495 segments (aggregates to real river-scale totals — see challenges below) |
+| Macrostrat (macrostrat.org) — Geologic Units API | Bedrock/geologic formation data, lithology, geologic age | Queried live per-coordinate, not bulk-loaded (see "Tech Stack" note) |
 
 All source records carry `source_url` and `source_type` (e.g., "Government Agency") for full data lineage and provenance tracking — a governance pattern built in intentionally, not an afterthought.
 
@@ -104,7 +105,7 @@ A detailed breakdown of what was used for what, since the actual development env
 
 
 
-Two governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
+Three governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
 
 **`find_vacant_claims_near_mineral(mineral_name, max_distance_miles, max_results)`**
 Finds vacant/lapsed claims near documented historical occurrences of a given mineral, flagging which claims closed most recently (freshest opportunities), which county each falls in, and sorting by proximity. Results are capped (default 50) with a note when more exist, for both usability and performance reasons -- see the performance investigation in "Real Engineering Challenges Solved."
@@ -112,7 +113,10 @@ Finds vacant/lapsed claims near documented historical occurrences of a given min
 **`check_land_access(latitude, longitude, mineral_search_radius_miles)`**
 Given a coordinate, returns a complete site report: land ownership type, every active mining claim covering that point (since any one active claim means "do not dig," and multiple claims commonly overlap in dense historic districts), a summarized vacant-claim count, the county, the nearest city and its distance, the nearest named river and its distance (useful for placer-deposit potential), documented minerals within a configurable radius (deduplicated at the individual-mineral level, not the raw-record level), and any hot springs within that same radius -- since hot springs and mineral-rich water are geologically related.
 
-Both tools query only the curated Silver layer through fixed, parameterized queries — the AI never gets arbitrary database access, only these specific, safe, purpose-built answers.
+**`get_bedrock_geology(latitude, longitude)`**
+Given a coordinate, queries the live Macrostrat API for bedrock/geologic formation data at that point -- rock unit name, lithology, and geologic age. Unlike the other two tools, this queries an external live API on each call rather than the local Silver layer, since bedrock data is naturally point-queried rather than bulk-loadable in a way that fits the Bronze/Silver pattern. Deduplicates by (unit name, lithology) since multiple overlapping source maps at different scales commonly cover the same coordinate.
+
+The first two tools query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The bedrock tool is the one exception, deliberately isolated so an external API's latency or availability can't affect the core governed local-data tools.
 
 ---
 
@@ -146,6 +150,10 @@ This section exists because the debugging process is arguably the most represent
 
 13. **A wrong data-completeness assumption caught by aggregation, not a single test case.** Filtering NHDFlowline to `FType 460` (StreamRiver) seemed like the obvious way to isolate real rivers/streams from canals, ditches, and pipelines. Loading succeeded without error and returned a plausible-looking row count -- but grouping the loaded data by river name and summing length revealed every major Colorado river (Colorado River, South Platte, Arkansas River) had implausibly short total lengths (e.g. Colorado River: ~51 km, when its real length through the state is roughly 450-500 km), while minor named creeks correctly showed hundreds of kilometers. Root cause: NHD represents the wider stretches of major rivers (anywhere they're mapped as a polygon area rather than a simple line) using a separate `FType 558` (ArtificialPath) code for network connectivity, which the original filter excluded entirely. Including both FTypes brought every major river to a realistic total length. This is a good example of why a single successful test case (a small creek, correctly represented as FType 460 for its entire length) doesn't validate a filter for the whole dataset -- aggregate validation caught what a spot-check would have missed.
 
+14. **A silently wrong test result from a caching/URL-matching quirk.** Before writing any bedrock-geology code, an initial test fetch of Macrostrat's lat/lng query endpoint appeared to succeed, but actually returned content from a different, earlier-cached query (a `strat_name_id`-based request from unrelated documentation) rather than genuinely querying the intended coordinate -- the response looked plausible (real GeoJSON, real geologic unit names) but was quietly wrong. Caught by noticing the returned units were scattered across Texas, Wyoming, and Alabama rather than clustered at the one Colorado coordinate requested. Re-tested by having the actual query URL fetched directly and independently, which returned correct, tightly-clustered results. A good reminder that a response "looking successful" (valid JSON, real-looking data) is not the same as confirming it actually answers the specific question asked.
+
+15. **A deliberate architectural boundary between governed local data and live external data.** Bedrock geology data doesn't fit the Bronze/Silver bulk-load pattern used everywhere else in this project -- Macrostrat is naturally point-queried rather than bulk-downloadable in a useful way. Rather than forcing it into the existing pattern or, alternatively, folding it into `check_land_access` for convenience, it was built as a separate, isolated tool (`get_bedrock_geology`) that queries the live API directly. This keeps the core governed tools (backed entirely by curated local data) free of external-API latency and availability risk, while still surfacing genuinely useful bedrock context through a clearly separate, clearly-labeled tool.
+
 ---
 
 ## Example Output
@@ -167,6 +175,13 @@ Nearest city: Buena Vista (4.7 mi away)
 Nearest named river: Merriam Creek (0.4 mi away)
 Documented minerals within 2.0 mi: Construction, Copper, Geothermal, Gold, Granite, Sand and Gravel, Silver
 Hot springs within 2.0 mi: Mt. Princeton Hot Springs (84.00°C, 0.7 mi)
+
+> get_bedrock_geology(latitude=39.5, longitude=-105.7)
+
+Bedrock geology at this location (3 mapped unit(s), from overlapping source maps at different scales):
+  - Paleoproterozoic metamorphic and undivided crystalline: sedimentary and volcanic gneiss (Paleoproterozoic) -- lithology: metamorphic and undivided crystalline: sedimentary and volcanic gneiss
+  - Biotitic gneiss, schist, and migmatite (Paleoproterozoic) -- lithology: Major:{biotite gneiss,schist,migmatite}, Minor:{gneiss,calc silicate schist,marble}
+  - Paleoproterozoic crystalline metamorphic rocks (Paleoproterozoic) -- lithology: orthogneiss/paragneiss
 ```
 
 Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place.
@@ -190,18 +205,21 @@ RockHound/
     ├── load_bronze.py                -- Bronze ingestion (Colorado-filtered, fast bulk insert)
     ├── load_hot_springs.py           -- Hot springs loader (live REST API query, Phase 2)
     ├── load_rivers.py                -- Rivers loader (NHD, Phase 2)
-    └── rockhound_server.py           -- MCP server with governed tools
+    └── rockhound_server.py           -- MCP server with governed tools, including get_bedrock_geology
+                                          (no separate load script or SQL file -- bedrock geology is
+                                          queried live from Macrostrat's API on each tool call, not
+                                          bulk-loaded, so there's no Bronze/Silver step for this source)
 ```
 
 ---
 
 ## Roadmap
 
-- **Phase 2 (in progress):**
+- **✅ Phase 2 (complete):**
   - ✅ Hot springs (Colorado Geological Survey, live REST API) — done, integrated into `check_land_access`
   - ✅ Rivers/streams (USGS NHD, placer deposit potential) — done, integrated into `check_land_access`
-  - ⏳ Bedrock/geologic formation data (Macrostrat live API) — confirmed accessible, not yet scoped in detail
-- **Phase 3 (scoped, not yet built):** Trailhead/parking entry points, elevation data, and vehicle-specific road access matching (ground clearance / 4WD requirements vs. a specific vehicle profile).
+  - ✅ Bedrock/geologic formation data (Macrostrat live API) — done, as a separate `get_bedrock_geology` tool
+- **Phase 3 (scoped, not yet built):** Trailhead/parking entry points (OpenStreetMap via Overpass API), elevation data (Open-Elevation API or USGS 3DEP), and vehicle-specific road access matching (ground clearance / 4WD requirements vs. a specific vehicle profile).
 
 ---
 
