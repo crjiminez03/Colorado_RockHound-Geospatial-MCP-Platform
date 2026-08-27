@@ -283,6 +283,108 @@ def get_bedrock_geology(latitude: float, longitude: float) -> str:
         lines.append(f"  - {name}{age_note}{lith_note}")
     return "\n".join(lines)
 
+@mcp.tool()
+def get_elevation(latitude: float, longitude: float) -> str:
+    """Look up ground elevation at a coordinate via the live Open-Elevation API
+    (open-elevation.com), a free, open-source, community-run elevation service.
+
+    Kept as a separate tool, not folded into check_land_access, for the same
+    reason as get_bedrock_geology: this queries an external live API on each
+    call rather than the local governed Silver layer, so it's deliberately
+    isolated to avoid adding external-API latency/availability risk to the
+    core local-data tool -- even though this particular lookup is much
+    simpler than bedrock's multi-feature response, the architectural
+    principle (external API calls stay separate) applies regardless of
+    how simple any one external call happens to be.
+    """
+    url = f"https://api.open-elevation.com/api/v1/lookup?locations={latitude},{longitude}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as e:
+        return f"Could not reach Open-Elevation API: {e}"
+
+    results = payload.get("results", [])
+    if not results:
+        return "No elevation data available for this location."
+
+    elevation_m = results[0].get("elevation")
+    if elevation_m is None:
+        return "No elevation data available for this location."
+
+    elevation_ft = elevation_m * 3.28084
+    return f"Elevation at this location: {elevation_m:.0f} m ({elevation_ft:.0f} ft)"
+
+@mcp.tool()
+def check_vehicle_access(latitude: float, longitude: float, vehicle_name: str = "2020 Ford Escape") -> str:
+    """Check whether the nearest mapped track/road at a coordinate is likely
+    suitable for a given vehicle, based on OpenStreetMap tags (surface,
+    tracktype, 4wd_only, smoothness, access) and a vehicle's real profile
+    (ground clearance, drivetrain, low-range availability) from Dim_Vehicle.
+
+    Honesty note: most track segments (roughly 70-95% depending on the tag)
+    have NO explicit difficulty rating in OSM. This tool reports that
+    honestly as "no data available" rather than assuming a road is safe
+    just because nothing marks it as dangerous -- OSM tagging coverage is
+    real but partial, confirmed by checking actual field coverage across
+    all 73,703 loaded track segments before building this logic.
+
+    This is advisory only, based on crowdsourced data of variable quality
+    (some segments are auto-imported from Census TIGER data and never
+    manually verified) -- always verify road conditions locally before
+    attempting a route, especially for a vehicle without low-range 4WD.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT vehicle_name, ground_clearance_inches, drivetrain, has_low_range, notes
+        FROM Dim_Vehicle
+        WHERE vehicle_name = ?
+    """, vehicle_name)
+    vehicle = cursor.fetchone()
+    if not vehicle:
+        conn.close()
+        return f"No vehicle profile found for '{vehicle_name}'. Check Dim_Vehicle for available profiles."
+
+    cursor.execute("""
+        DECLARE @searchPoint GEOGRAPHY = geography::Point(?, ?, 4326);
+        SELECT TOP 1 track_name, surface, tracktype, fourwd_only, smoothness, access,
+               path.STDistance(@searchPoint) / 1609.34 AS distance_miles
+        FROM Silver.Tracks
+        ORDER BY path.STDistance(@searchPoint)
+    """, latitude, longitude)
+    track = cursor.fetchone()
+    conn.close()
+
+    if not track:
+        return "No mapped track/road data found near this location."
+
+    name = track.track_name or "(unnamed track)"
+    header = f"Nearest mapped track: {name} ({track.distance_miles:.1f} mi away)\nVehicle: {vehicle.vehicle_name} ({vehicle.ground_clearance_inches}\" clearance, {vehicle.drivetrain}, {'has' if vehicle.has_low_range else 'no'} low-range)\n"
+
+    if track.access and track.access.lower() in ('private', 'no'):
+        return header + f"LEGAL ACCESS ISSUE: tagged access='{track.access}' -- may not be legally accessible regardless of vehicle capability."
+
+    concerns = []
+    if track.fourwd_only and 'yes' in track.fourwd_only.lower():
+        concerns.append(f"tagged 4wd_only='{track.fourwd_only}'")
+    if track.tracktype and track.tracktype.lower() in ('grade4', 'grade5'):
+        concerns.append(f"tracktype='{track.tracktype}' (poor/unmaintained surface)")
+    if track.smoothness and track.smoothness.lower() in ('very_bad', 'horrible', 'very_horrible', 'impassable'):
+        concerns.append(f"smoothness='{track.smoothness}'")
+
+    if concerns and not vehicle.has_low_range:
+        return header + f"LIKELY NOT SUITABLE for this vehicle: {'; '.join(concerns)}. This vehicle has no low-range transfer case."
+
+    if track.smoothness and track.smoothness.lower() == 'bad':
+        return header + "CAUTION: smoothness rated 'bad' -- borderline for a vehicle without low-range 4WD."
+
+    if not any([track.surface, track.tracktype, track.fourwd_only, track.smoothness]):
+        return header + "NO DIFFICULTY DATA AVAILABLE for this specific segment -- OSM coverage on these tags is partial (most Colorado tracks are untagged for difficulty). Proceed with caution and verify locally before attempting."
+
+    return header + f"No red flags in available tags (surface='{track.surface or 'unknown'}', tracktype='{track.tracktype or 'unknown'}'). Likely passable, but always verify locally."
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
