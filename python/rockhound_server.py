@@ -16,12 +16,13 @@ exposed via a Cloudflare quick tunnel (`cloudflared tunnel --url
 http://localhost:8000`) and verified working through the official MCP
 Inspector (`npx @modelcontextprotocol/inspector`).
 
-Architecture note: four tools (find_vacant_claims_near_mineral,
-check_land_access, check_vehicle_access, find_mineral_locations) query only
-the local governed Silver layer. Two tools (get_bedrock_geology,
-get_elevation) query live external APIs instead, and are deliberately kept
-separate from the local-data tools to avoid adding external-API
-latency/availability risk to the core governed platform.
+Architecture note: five tools (find_vacant_claims_near_mineral,
+find_vacant_claims_near_location, check_land_access, check_vehicle_access,
+find_mineral_locations) query only the local governed Silver layer. Two
+tools (get_bedrock_geology, get_elevation) query live external APIs instead,
+and are deliberately kept separate from the local-data tools to avoid
+adding external-API latency/availability risk to the core governed
+platform.
 """
 
 from mcp.server import MCPServer
@@ -42,13 +43,14 @@ CONN_STR = (
 # economic-minerals database, not a gem-collector's database).
 #
 # CONFIRMED entries were verified directly against the real loaded data
-# (either the collector name genuinely does not appear anywhere in
-# Silver.Mineral_Occurrences while the parent commodity does -- e.g.
-# Amazonite/Feldspar, Rhodochrosite/Manganese, Halite/Salt -- or the
-# mapping is such extremely well-established, universal mineralogy that
-# no reasonable geologic classification would differ, e.g. Ruby/Sapphire
-# are always varieties of Corundum, Aquamarine/Emerald are always
-# varieties of Beryl, regardless of which database is asked).
+# (see sql/10_mineral_name_verification_queries.sql) -- either the
+# collector name genuinely does not appear anywhere in
+# Silver.Mineral_Occurrences while the parent commodity does (Amazonite/
+# Feldspar, Rhodochrosite/Manganese, Halite/Salt), or the mapping is such
+# extremely well-established, universal mineralogy that no reasonable
+# geologic classification would differ (Ruby/Sapphire are always
+# varieties of Corundum, Aquamarine/Emerald are always varieties of
+# Beryl, regardless of which database is asked).
 GEM_VARIETY_TO_COMMODITY = {
     # Quartz family
     'amethyst': 'Quartz',
@@ -137,6 +139,12 @@ GEM_VARIETY_TO_COMMODITY = {
 # mean either "genuinely not documented" or "recorded under yet another
 # name we haven't identified," and the tool says so explicitly rather
 # than implying the same certainty as a confirmed mapping.
+#
+# NOT included here: "Topaz" -- despite Colorado having famous topaz
+# localities (Pikes Peak, Devil's Head), there was genuinely conflicting
+# reasoning about its likely parent commodity (possibly its own name,
+# possibly Tin/Tungsten given its common pegmatite association) and no
+# confident guess was made -- searched literally as typed instead.
 GEM_VARIETY_TO_COMMODITY_LOWER_CONFIDENCE = {
     'wulfenite': 'Molybdenum',   # PbMoO4 -- Molybdenum is the defining economic metal
     'chrysocolla': 'Copper',     # common secondary copper mineral, parallels confirmed Malachite/Azurite
@@ -192,6 +200,13 @@ def find_vacant_claims_near_mineral(mineral_name: str, max_distance_miles: float
     underlying name instead. See GEM_VARIETY_TO_COMMODITY (confirmed against real
     data) and GEM_VARIETY_TO_COMMODITY_LOWER_CONFIDENCE (educated guesses, flagged
     as such in the output). Not exhaustive.
+
+    Bug history: latitude/longitude were originally typed as plain "float = None",
+    which passed Python's own syntax checks but failed MCP's strict argument
+    validation at runtime (the type hint alone says "must be a real number",
+    the default value doesn't override that for validation purposes) -- any
+    call omitting coordinates failed with a validation error. Fixed by typing
+    them as Optional[float] instead.
 
     Performance history: a plain JOIN on STDistance() took 13+ minutes for
     common minerals due to the spatial index not being used for that join
@@ -277,6 +292,103 @@ def find_vacant_claims_near_mineral(mineral_name: str, max_distance_miles: float
 
 
 @mcp.tool()
+def find_vacant_claims_near_location(latitude: float, longitude: float, radius_miles: float = 5.0, max_results: int = 50) -> str:
+    """Find vacant (previously-claimed, now open) mining claims within a radius of a
+    specific coordinate -- a location-based claim search, complementing
+    find_vacant_claims_near_mineral's mineral-based search. Useful for "what's open
+    near this specific spot" (e.g., near an existing claim) rather than "where can I
+    find mineral X statewide."
+
+    Also reports documented minerals within the same radius, automatically -- no
+    mineral name needs to be entered. Reuses the same individual-mineral
+    deduplication logic already proven in check_land_access (splitting comma-
+    separated commodity lists into individual names before deduplicating, and
+    filtering out the literal "nan" string artifact from a Phase 1 data-quality bug).
+
+    Does not filter claims by mineral -- for mineral-specific vacant-claim searches,
+    use find_vacant_claims_near_mineral instead (which also supports optional
+    latitude/longitude for the same kind of location narrowing).
+
+    For broader area context (nearest city, river, trailhead, hot springs) at the
+    same coordinate, pair this with check_land_access.
+
+    Performance design: applies the same two-phase, capped-then-enriched pattern
+    already proven throughout this project from the start -- fast distance-only
+    matching and capping first, then county enrichment only on the small final
+    result set, rather than risk recreating the correlated-subquery timeout found
+    earlier in find_mineral_locations.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    radius_meters = radius_miles * 1609.34
+
+    cursor.execute("""
+        DECLARE @searchPoint GEOGRAPHY = geography::Point(?, ?, 4326);
+        SELECT TOP (500) claim_key, claim_name, is_recently_closed, date_closed,
+               boundary.STDistance(@searchPoint) / 1609.34 AS distance_miles
+        FROM Silver.Claims
+        WHERE is_vacant = 1
+          AND boundary.STDistance(@searchPoint) < ?
+        ORDER BY distance_miles
+    """, latitude, longitude, radius_meters)
+    all_rows = cursor.fetchall()
+
+    claims_section = ""
+    if not all_rows:
+        claims_section = f"No vacant claims found within {radius_miles} miles of that location.\n"
+    else:
+        rows = all_rows[:max_results]
+
+        county_by_key = {}
+        claim_keys = [r.claim_key for r in rows]
+        placeholders = ",".join("?" for _ in claim_keys)
+        cursor.execute(f"""
+            SELECT c.claim_key, cty.county_name
+            FROM Silver.Claims c
+            OUTER APPLY (
+                SELECT TOP 1 county_name FROM Silver.Counties co
+                WHERE co.boundary.STIntersects(c.boundary) = 1
+            ) cty
+            WHERE c.claim_key IN ({placeholders})
+        """, claim_keys)
+        for r in cursor.fetchall():
+            county_by_key[r.claim_key] = r.county_name
+
+        results = []
+        for r in rows:
+            recency_note = f" [CLOSED RECENTLY: {r.date_closed}]" if r.is_recently_closed else ""
+            county = county_by_key.get(r.claim_key)
+            county_note = f", {county} County" if county else ""
+            results.append(f"{r.claim_name}{county_note} - {r.distance_miles:.1f} mi away{recency_note}")
+        header = f"Showing closest {len(rows)} of {len(all_rows)} total vacant claims within {radius_miles} mi:\n" if len(all_rows) > max_results else f"Showing all {len(rows)} vacant claims within {radius_miles} mi:\n"
+        claims_section = header + "\n".join(results) + "\n"
+
+    cursor.execute("""
+        DECLARE @searchPoint GEOGRAPHY = geography::Point(?, ?, 4326);
+        SELECT DISTINCT commodity_type
+        FROM Silver.Mineral_Occurrences
+        WHERE location.STDistance(@searchPoint) < ?
+    """, latitude, longitude, radius_meters)
+    raw_commodity_strings = [r.commodity_type for r in cursor.fetchall() if r.commodity_type]
+    conn.close()
+
+    minerals_section = ""
+    if raw_commodity_strings:
+        individual_minerals = set()
+        for raw_string in raw_commodity_strings:
+            for mineral in raw_string.split(','):
+                cleaned = mineral.strip()
+                if cleaned and cleaned.lower() != 'nan':
+                    individual_minerals.add(cleaned)
+        unique_minerals = sorted(individual_minerals)[:20]
+        minerals_section = f"\nDocumented minerals within {radius_miles} mi: {', '.join(unique_minerals)}"
+    else:
+        minerals_section = f"\nNo documented mineral occurrences within {radius_miles} mi"
+
+    return claims_section + minerals_section
+
+
+@mcp.tool()
 def find_mineral_locations(mineral_name: str, latitude: Optional[float] = None, longitude: Optional[float] = None,
                              radius_miles: Optional[float] = None, max_results: int = 50) -> str:
     """Find general areas (nearest town + county) where a mineral has been documented --
@@ -307,7 +419,9 @@ def find_mineral_locations(mineral_name: str, latitude: Optional[float] = None, 
     "location" instead of "boundary" in the nearest-city lookup, silently
     resolving to the outer CTE's own column and returning an arbitrary, wrong
     nearest city (confirmed: Cheraw, Otero County, for a Mt. Princeton/Chaffee
-    County search). Fixed by correcting the column reference.
+    County search). Fixed by correcting the column reference. Also affected by
+    the same Optional[float] validation bug described in
+    find_vacant_claims_near_mineral.
 
     Honesty note: 200 is a SAMPLE of raw occurrences for common minerals, not
     every one -- reported explicitly rather than implying completeness.
