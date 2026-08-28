@@ -115,10 +115,13 @@ A detailed breakdown of what was used for what, since the actual development env
 
 
 
-Six governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
+Seven governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
 
 **`find_vacant_claims_near_mineral(mineral_name, max_distance_miles, max_results, latitude, longitude, search_radius_miles)`**
 Finds vacant/lapsed claims near documented historical occurrences of a given mineral, flagging which claims closed most recently (freshest opportunities), which county each falls in, and sorting by proximity. Results are capped (default 50) with a note when more exist, for both usability and performance reasons -- see the performance investigation in "Real Engineering Challenges Solved." Optional latitude/longitude narrow the search to occurrences within search_radius_miles (default 2.0) of a specific point, rather than searching the entire state -- useful for "what can I find near my claim" rather than "where can I find this anywhere in Colorado."
+
+**`find_vacant_claims_near_location(latitude, longitude, radius_miles, max_results)`**
+A location-based counterpart to the tool above: "what's open near this specific spot," with no mineral name required. Also automatically reports documented minerals within the same radius, reusing the same individual-mineral deduplication logic already proven in `check_land_access`. Built directly from a real user question -- wanting to see open ground and mineral context around an existing claim generally, not tied to searching for one specific mineral.
 
 **`find_mineral_locations(mineral_name, latitude, longitude, radius_miles, max_results)`**
 A trip-planning tool: "where should I even start looking for X," grouped by nearest town and county, not a flat list of raw coordinates. Deliberately does not check claim availability -- pairs with `find_vacant_claims_near_mineral` or `check_land_access` as a natural next step once a promising area is identified. Works statewide by default, or narrows to a radius around a point if coordinates are given.
@@ -137,7 +140,7 @@ Given a coordinate, queries the live Open-Elevation API for ground elevation, re
 
 **Gem-variety name translation, shared by both mineral-search tools:** MRDS is an economic-minerals database, not a gem-collector's database -- it records "Feldspar," not "Amazonite," and "Manganese," not "Rhodochrosite." A curated `GEM_VARIETY_TO_COMMODITY` mapping (confirmed against the real loaded data for entries like Amazonite/Feldspar and Rhodochrosite/Manganese) translates common collector names automatically, always telling the user when a translation happened. A second, separate `GEM_VARIETY_TO_COMMODITY_LOWER_CONFIDENCE` mapping covers additional Colorado classics (Rhodonite, Turquoise, Wulfenite, Chrysocolla, Apatite, Zircon) as educated geologic guesses, not individually confirmed against the data, and is worded differently in the output specifically to signal that lower certainty rather than implying the same confidence as a verified entry. Deliberately not exhaustive -- e.g. Topaz was left unmapped after genuinely conflicting reasoning about its likely parent commodity, rather than force a guess.
 
-The first four tools (`find_vacant_claims_near_mineral`, `find_mineral_locations`, `check_land_access`, `check_vehicle_access`) query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The last two (`get_bedrock_geology`, `get_elevation`) are the deliberate exception: both query live external APIs rather than local data, and are kept as separate, clearly-labeled tools so an external API's latency or availability can never affect the core governed local-data tools.
+The first five tools (`find_vacant_claims_near_mineral`, `find_vacant_claims_near_location`, `find_mineral_locations`, `check_land_access`, `check_vehicle_access`) query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The last two (`get_bedrock_geology`, `get_elevation`) are the deliberate exception: both query live external APIs rather than local data, and are kept as separate, clearly-labeled tools so an external API's latency or availability can never affect the core governed local-data tools.
 
 ---
 
@@ -193,6 +196,8 @@ This section exists because the debugging process is arguably the most represent
 
 24. **A curated knowledge layer, deliberately split by confidence level rather than presented as uniformly authoritative.** MRDS records minerals by economic commodity name, not by the collector/gem-variety name a rockhound is likely to actually search for (confirmed directly: "Amazonite" appears nowhere in the dataset, only "Feldspar"; same pattern for Rhodochrosite/Manganese and Halite/Salt). Rather than leaving this as a silent gap or guessing uniformly across the board, a `GEM_VARIETY_TO_COMMODITY` mapping was built and split into two explicitly separate dictionaries: entries individually confirmed against the real data (or so mineralogically universal that no reasonable database would differ, e.g. Ruby/Sapphire as Corundum varieties), and a second `GEM_VARIETY_TO_COMMODITY_LOWER_CONFIDENCE` set of educated guesses based on standard economic geology reasoning but not individually verified (e.g. Wulfenite -> Molybdenum, reasoned from its chemical formula). Each dictionary produces different, honestly worded output, so a lower-confidence guess is never presented with the same certainty as a confirmed mapping. At least one genuinely plausible Colorado name (Topaz) was deliberately left unmapped after real, conflicting reasoning about its likely parent commodity, rather than forcing a guess purely for the sake of completeness.
 
+25. **A tool gap identified directly from real end-user feedback, not a hypothetical.** After sharing early results with a friend and real claim holder, a genuine, specific question came up: what's generally open and documented near a given claim, without having to search by one specific mineral name first. The existing `find_vacant_claims_near_mineral` genuinely couldn't answer this cleanly -- it requires a mineral name as its primary search key, only optionally narrowed by location. Rather than overloading that tool's parameters further, a new, purpose-built tool (`find_vacant_claims_near_location`) was added as its natural counterpart: location as the primary key, mineral name not required at all, and automatically enriched with the same documented-minerals summary already proven in `check_land_access`. Verified against a real, known claim by confirming the closest results (0.0 mi) matched claims already independently confirmed to overlap that exact point in earlier testing, before trusting the wider-radius results around it.
+
 ---
 
 ## Example Output
@@ -247,9 +252,24 @@ in a promising area before visiting.
 Nearest mapped track: Forrester Road (0.0 mi away)
 Vehicle: 2020 Ford Escape (7.9" clearance, AWD, no low-range)
 LIKELY NOT SUITABLE for this vehicle: tagged 4wd_only='yes'; smoothness='very_bad'. This vehicle has no low-range transfer case.
+
+> find_vacant_claims_near_location(latitude=39.5214528, longitude=-105.4841972, radius_miles=10.0)
+
+Showing closest 50 of 135 total vacant claims within 10.0 mi:
+J-PEG, Park County - 0.0 mi away
+LONE WALKER, Park County - 0.0 mi away
+DOUBLE RAINBOW, Park County - 0.0 mi away
+PEGMATITE #2, Park County - 0.0 mi away
+PEGMATITE #1, Park County - 0.2 mi away
+...
+KATURAN #38, Park County - 7.0 mi away
+KATURAN #34, Park County - 7.0 mi away
+
+Documented minerals within 10.0 mi: Beryllium, Clay, Construction, Crushed/Broken,
+Feldspar, Nickel, Sand and Gravel, Stone, Uranium
 ```
 
-Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place. The vehicle-access example above was deliberately tested against a coordinate pulled directly from a known-tagged road (rather than an arbitrary point) specifically to confirm the hazard-flagging logic works, not just its "no data available" fallback. The Rhodochrosite example is a real-world check too: Alma, Park County correctly appears in the results, and Alma is genuinely the nearest town to the Sweet Home Mine, one of the most famous rhodochrosite localities in the world -- the gem-variety translation and the underlying spatial data agree with real, independently-known geology.
+Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place. The vehicle-access example above was deliberately tested against a coordinate pulled directly from a known-tagged road (rather than an arbitrary point) specifically to confirm the hazard-flagging logic works, not just its "no data available" fallback. The Rhodochrosite example is a real-world check too: Alma, Park County correctly appears in the results, and Alma is genuinely the nearest town to the Sweet Home Mine, one of the most famous rhodochrosite localities in the world -- the gem-variety translation and the underlying spatial data agree with real, independently-known geology. The `find_vacant_claims_near_location` example shows a nice additional real-world signal too: several nearby claim names (PEGMATITE #1/#2, the KATURAN series) and the documented minerals (Beryllium, Feldspar) both independently point to the same real geology -- genuine pegmatite country, where those two minerals classically occur together.
 
 ---
 
@@ -277,7 +297,7 @@ RockHound/
     ├── load_rivers.py                -- Rivers loader (NHD, Phase 2)
     ├── load_trailheads.py            -- Trailheads loader (OpenStreetMap/Overpass, Phase 3)
     ├── load_tracks.py                -- Tracks loader (OpenStreetMap/Overpass, Phase 3)
-    └── rockhound_server.py           -- MCP server with all 6 governed tools, including
+    └── rockhound_server.py           -- MCP server with all 7 governed tools, including
                                           get_bedrock_geology and get_elevation (no separate
                                           load script or SQL file for either -- both are
                                           queried live from their respective APIs on each
