@@ -803,6 +803,71 @@ def get_elevation(latitude: float, longitude: float) -> str:
     elevation_ft = elevation_m * 3.28084
     return f"Elevation at this location: {elevation_m:.0f} m ({elevation_ft:.0f} ft)"
 
+@mcp.tool()
+def check_fossil_potential(latitude: float, longitude: float) -> str:
+    """Look up fossil-yield potential at a coordinate via BLM's live PFYC
+    (Potential Fossil Yield Classification) REST API -- a real BLM system
+    used to predict which geologic formations are likely to contain
+    scientifically significant fossils, on a 1 (very low) to 5 (very high)
+    scale, with 'U' for unknown/understudied areas.
+
+    Unlike the local-data tools in this server, this queries an external
+    live API on each call rather than the local governed Silver layer, for
+    the same reason as get_bedrock_geology: PFYC classifies geologic
+    formation polygons, which is naturally point-queried rather than
+    bulk-loadable in a way that fits the Bronze/Silver pattern. Kept
+    separate to avoid adding external-API latency/failure risk to the
+    core local-data tools.
+
+    Technical note: this queries MapServer/1 specifically (the real PFYC
+    classification layer), not MapServer/0 (a map-index/citation layer
+    for the underlying source USGS maps, which looks superficially similar
+    but contains no actual fossil-potential data) -- confirmed by testing
+    both layers directly against a known coordinate.
+    """
+    PFYC_LABELS = {
+        '1': 'Very Low',
+        '2': 'Low',
+        '3': 'Moderate/Unknown',
+        '4': 'High',
+        '5': 'Very High',
+        'U': 'Unknown/Understudied',
+    }
+
+    url = "https://gis.blm.gov/arcgis/rest/services/geophysical/BLM_Natl_PFYC/MapServer/1/query"
+    params = {
+        "geometry": f"{longitude},{latitude}",
+        "geometryType": "esriGeometryPoint",
+        "spatialRel": "esriSpatialRelIntersects",
+        "inSR": "4326",
+        "outFields": "*",
+        "returnGeometry": "false",
+        "f": "json"
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        return f"Could not reach BLM's PFYC API: {e}"
+
+    features = data.get("features", [])
+    if not features:
+        return "No PFYC fossil-potential data available for this location (may be outside mapped BLM administrative areas)."
+
+    attrs = features[0].get("attributes", {})
+    rank = attrs.get("PFYC_CLASS_CD", "")
+    label = PFYC_LABELS.get(rank, f"Unrecognized code '{rank}'")
+    unit_name = attrs.get("GEO_UNIT_NM", "Unknown unit")
+    earliest_age = attrs.get("EARLIEST_AGE_NM", "")
+    latest_age = attrs.get("LATEST_AGE_NM", "")
+    age_note = f" ({earliest_age} to {latest_age})" if earliest_age and earliest_age != latest_age else f" ({earliest_age})" if earliest_age else ""
+
+    return (f"Fossil yield potential (PFYC): {rank} - {label}\n"
+            f"Geologic unit: {unit_name}{age_note}\n"
+            f"Note: PFYC ranks the underlying geologic formation, not confirmed fossil finds -- "
+            f"a low rank often reflects rock type unsuitable for fossil preservation (e.g. igneous/metamorphic rock), "
+            f"not an absence of study.")
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
