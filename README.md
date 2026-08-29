@@ -54,6 +54,7 @@ flowchart TD
 | [OpenStreetMap](https://www.openstreetmap.org) (via the [Overpass API](https://overpass-api.de/), tag [highway=trailhead](https://wiki.openstreetmap.org/wiki/Tag:highway%3Dtrailhead)) | Trailhead locations, operator, fee info | 552 (name populated on 85%, operator on 16%, fee on 8%) |
 | [Open-Elevation](https://open-elevation.com) (API) | Ground elevation at a coordinate, in meters | Queried live per-coordinate, not bulk-loaded |
 | [OpenStreetMap](https://www.openstreetmap.org) (via the [Overpass API](https://overpass-api.de/), tag [highway=track](https://wiki.openstreetmap.org/wiki/Tag:highway%3Dtrack)) | Track/dirt road locations, surface, tracktype, 4wd_only, smoothness — for vehicle-access matching | 73,703 (surface populated on 29%, tracktype on 16%, 4wd_only on 5%, smoothness on 10%) |
+| [BLM PFYC (Potential Fossil Yield Classification)](https://www.blm.gov/blog/2021-07-08/pfyc-rapid-assessment-tool-paleontology) — Geologic Formation Polygons | Fossil-yield potential ranking (1-5, or "U" for unstudied) by geologic formation, with formation name and age | Queried live per-coordinate, not bulk-loaded (BLM-administered land only — see "Known Limitations") |
 
 All source records carry `source_url` and `source_type` (e.g., "Government Agency") for full data lineage and provenance tracking — a governance pattern built in intentionally, not an afterthought.
 
@@ -115,7 +116,7 @@ A detailed breakdown of what was used for what, since the actual development env
 
 
 
-Seven governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
+Eight governed tools, deliberately scoped rather than exposing raw SQL access to an AI system:
 
 **`find_vacant_claims_near_mineral(mineral_name, max_distance_miles, max_results, latitude, longitude, search_radius_miles)`**
 Finds vacant/lapsed claims near documented historical occurrences of a given mineral, flagging which claims closed most recently (freshest opportunities), which county each falls in, and sorting by proximity. Results are capped (default 50) with a note when more exist, for both usability and performance reasons -- see the performance investigation in "Real Engineering Challenges Solved." Optional latitude/longitude narrow the search to occurrences within search_radius_miles (default 2.0) of a specific point, rather than searching the entire state -- useful for "what can I find near my claim" rather than "where can I find this anywhere in Colorado."
@@ -138,9 +139,12 @@ Given a coordinate, queries the live Macrostrat API for bedrock/geologic formati
 **`get_elevation(latitude, longitude)`**
 Given a coordinate, queries the live Open-Elevation API for ground elevation, returned in both meters and feet.
 
+**`check_fossil_potential(latitude, longitude)`**
+Given a coordinate, queries BLM's live PFYC (Potential Fossil Yield Classification) API -- a real BLM system ranking geologic formations by their likelihood of containing scientifically significant fossils, on a 1 (very low) to 5 (very high) scale, plus "U" for unknown/understudied. Mirrors `get_bedrock_geology`'s architecture (live external API, kept separate from local governed data) for the same reason -- PFYC classifies geologic formation polygons, naturally point-queried rather than bulk-loadable. Validated across every distinct real outcome the tool can produce (see "Real Engineering Challenges Solved"), each independently checked against real, known geology -- including a genuine jurisdictional coverage gap discovered at a National Park Service unit, since PFYC is fundamentally a BLM system.
+
 **Gem-variety name translation, shared by both mineral-search tools:** MRDS is an economic-minerals database, not a gem-collector's database -- it records "Feldspar," not "Amazonite," and "Manganese," not "Rhodochrosite." A curated `GEM_VARIETY_TO_COMMODITY` mapping (confirmed against the real loaded data for entries like Amazonite/Feldspar and Rhodochrosite/Manganese) translates common collector names automatically, always telling the user when a translation happened. A second, separate `GEM_VARIETY_TO_COMMODITY_LOWER_CONFIDENCE` mapping covers additional Colorado classics (Rhodonite, Turquoise, Wulfenite, Chrysocolla, Apatite, Zircon) as educated geologic guesses, not individually confirmed against the data, and is worded differently in the output specifically to signal that lower certainty rather than implying the same confidence as a verified entry. Deliberately not exhaustive -- e.g. Topaz was left unmapped after genuinely conflicting reasoning about its likely parent commodity, rather than force a guess.
 
-The first five tools (`find_vacant_claims_near_mineral`, `find_vacant_claims_near_location`, `find_mineral_locations`, `check_land_access`, `check_vehicle_access`) query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The last two (`get_bedrock_geology`, `get_elevation`) are the deliberate exception: both query live external APIs rather than local data, and are kept as separate, clearly-labeled tools so an external API's latency or availability can never affect the core governed local-data tools.
+The first five tools (`find_vacant_claims_near_mineral`, `find_vacant_claims_near_location`, `find_mineral_locations`, `check_land_access`, `check_vehicle_access`) query only the curated Silver layer through fixed, parameterized queries -- the AI never gets arbitrary database access, only these specific, safe, purpose-built answers. The last three (`get_bedrock_geology`, `get_elevation`, `check_fossil_potential`) are the deliberate exception: all three query live external APIs rather than local data, and are kept as separate, clearly-labeled tools so an external API's latency or availability can never affect the core governed local-data tools.
 
 ---
 
@@ -203,6 +207,10 @@ This section exists because the debugging process is arguably the most represent
 27. **A sentinel placeholder value hiding in plain sight, caught by asking a genuine follow-up question rather than a code review.** A user question -- "when did these specific claims actually go vacant?" -- led to checking `date_closed` on 24 real claims near a known point, and every single one showed the exact same date: `1900-01-01`. A single coincidental match might be plausible; 24 claims in one small area all closing on the literal same calendar day over a century ago is not. Confirmed at scale with `GROUP BY date_closed`: 244,515 rows -- the overwhelming majority of `Silver.Claims` -- share this one value, versus a normal, varied spread of real dates you'd expect across genuinely different historical closures. This is a classic sentinel/default value baked into the original BLM source data itself (likely from an older bulk-administrative closure process that didn't track individual dates), not a bug introduced anywhere in this pipeline -- but it went completely undetected through every previous phase of this project because no prior tool or test actually surfaced or scrutinized the `date_closed` field's real distribution until a genuine user question prompted it.
 
 28. **A real, working cross-service join technique discovered, honestly scoped, and not over-applied.** Investigating whether real BLM serial numbers (`CSE_NR`) or closure dates could be added to `Silver.Claims` led through several dead ends -- an internal GIS object ID mistaken at first glance for a real serial number (ruled out: 19-digit format, and the same claim name appeared under multiple different ID values, which a real unique identifier would never do), a live "Closed" REST service that turned out to only contain ~1,171 recently-closed Colorado records rather than the full ~288,000-claim historical archive, and an unrelated action-history layer (`NLSDB_LND_HIST`) with no obvious shared key to the claims data. A working join was eventually found via a shared `SF_ID` field present on both the Closed-claims service and the action-history layer, confirmed live by pulling one real claim's `SF_ID` and finding matching action records for it, including a real closure reason (`"Claim Abandoned/Forfeited"`) alongside a real date. Rather than assuming this solved the problem generally, it was explicitly tested against all 24 real claims from the earlier prospecting-trip example: only 2 of 24 existed in the smaller recently-closed service at all, confirming the technique is real and useful, but genuinely limited to recent closures -- not a fix for the sentinel-date problem across the bulk of historical claims. Concluded as a documented, honest limitation rather than forcing a partial technique to look like a complete solution.
+
+29. **A wrong layer selected on the first attempt, caught before any code was written around it.** Adding fossil-yield potential meant finding BLM's live PFYC REST service, initially queried at `MapServer/0` -- which returned real, well-formed JSON with real-looking field names, but was actually the wrong layer entirely: a map-index/citation layer describing which source USGS maps were used to build PFYC, not the fossil classification data itself. Caught by checking the real layer list first (`MapServer/0: PFYC Geologic Map Index Polygons`, `MapServer/1: PFYC Geologic Formation Polygons`) rather than assuming layer 0 was correct by default, and confirmed by the real fields returned (map titles and authors, not a PFYC rank) not matching what the tool needed. The same lesson as challenge #14/#18 in a new form -- a well-formed, error-free response is not the same as confirming it's the *right* response.
+
+30. **A five-value validation matrix, deliberately pursued to completion rather than stopping at the first successful test.** `check_fossil_potential`'s live API could theoretically return five meaningfully different outcomes (ranks 1 through 5, "U" for unstudied, or no data at all), and confirming just one or two of these would have left real, untested code paths in production. Each was deliberately sought out and confirmed against independently known real geology: rank 1 at a known intrusive-rock coordinate (correct -- igneous rock cannot preserve fossils), rank 3 at the Fountain Formation (correct -- real sedimentary rock), rank 5 at Douglas Pass's Wasatch Formation (correct -- a well-documented fossil-bearing formation directly underlying the famous Green River Formation in that region), rank U at a coordinate that returned recent surface colluvium, and a genuine "no data" result at Florissant Fossil Beds -- which, on inspection, revealed a real, previously undiscussed limitation: PFYC is fundamentally a BLM system, and its coverage may not extend into non-BLM land (Florissant is a National Park Service unit) regardless of how well-studied the underlying geology is. Two coordinate guesses aimed at specific named formations (Dinosaur Ridge's Morrison Formation, and a trail near Florissant's exposed shale) missed their target formations entirely and landed on adjacent, differently-aged rock instead -- a concrete reminder that these geologic polygon boundaries are frequently narrow, and "close" in ordinary terms is not the same as "within the same mapped unit" for this kind of data.
 
 ---
 
@@ -272,9 +280,17 @@ ELK CREEK #3, Park County - 1.0 mi away (39.519959, -105.507266)
 ELK CREEK #4, Park County - 1.0 mi away (39.519959, -105.507266)
 
 No documented mineral occurrences within 1.0 mi
+
+> check_fossil_potential(latitude=39.5975, longitude=-108.80306)
+
+Fossil yield potential (PFYC): 5 - Very High
+Geologic unit: Wasatch Formation (Paleocene to Eocene)
+Note: PFYC ranks the underlying geologic formation, not confirmed fossil finds -- a low rank
+often reflects rock type unsuitable for fossil preservation (e.g. igneous/metamorphic rock),
+not an absence of study.
 ```
 
-Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place. The vehicle-access example above was deliberately tested against a coordinate pulled directly from a known-tagged road (rather than an arbitrary point) specifically to confirm the hazard-flagging logic works, not just its "no data available" fallback. The Rhodochrosite example is a real-world check too: Alma, Park County correctly appears in the results, and Alma is genuinely the nearest town to the Sweet Home Mine, one of the most famous rhodochrosite localities in the world -- the gem-variety translation and the underlying spatial data agree with real, independently-known geology. The `find_vacant_claims_near_location` example above shows real coordinates that were plotted on an actual map for real-world prospecting trip planning -- 24 distinct vacant claims within a mile of one point, several sharing identical coordinates, consistent with the same historic-district overlap pattern already confirmed elsewhere in this project.
+Note the cross-source validation: "Geothermal" appears independently in the USGS mineral database at the same location where the Colorado Geological Survey's hot springs data shows Mt. Princeton Hot Springs (84°C), and the nearest named river (Merriam Creek, a real tributary in that same drainage) confirms the tool correctly favors precise nearby features over the much larger but farther-away Arkansas River -- three independently sourced datasets all coherently describing the same real place. The vehicle-access example above was deliberately tested against a coordinate pulled directly from a known-tagged road (rather than an arbitrary point) specifically to confirm the hazard-flagging logic works, not just its "no data available" fallback. The Rhodochrosite example is a real-world check too: Alma, Park County correctly appears in the results, and Alma is genuinely the nearest town to the Sweet Home Mine, one of the most famous rhodochrosite localities in the world -- the gem-variety translation and the underlying spatial data agree with real, independently-known geology. The `find_vacant_claims_near_location` example above shows real coordinates that were plotted on an actual map for real-world prospecting trip planning -- 24 distinct vacant claims within a mile of one point, several sharing identical coordinates, consistent with the same historic-district overlap pattern already confirmed elsewhere in this project. The `check_fossil_potential` example shows the strongest possible real-world validation of the whole tool: Douglas Pass's Wasatch Formation is independently documented as directly underlying the famous Green River Formation in this exact region, and the tool's live-queried "5 - Very High" ranking agrees precisely with that established, independently-known geology.
 
 ---
 
@@ -302,12 +318,13 @@ RockHound/
     ├── load_rivers.py                -- Rivers loader (NHD, Phase 2)
     ├── load_trailheads.py            -- Trailheads loader (OpenStreetMap/Overpass, Phase 3)
     ├── load_tracks.py                -- Tracks loader (OpenStreetMap/Overpass, Phase 3)
-    └── rockhound_server.py           -- MCP server with all 7 governed tools, including
-                                          get_bedrock_geology and get_elevation (no separate
-                                          load script or SQL file for either -- both are
-                                          queried live from their respective APIs on each
-                                          tool call, not bulk-loaded, so there's no
-                                          Bronze/Silver step for either source)
+    └── rockhound_server.py           -- MCP server with all 8 governed tools, including
+                                          get_bedrock_geology, get_elevation, and
+                                          check_fossil_potential (no separate load script or
+                                          SQL file for any of the three -- all are queried
+                                          live from their respective APIs on each tool call,
+                                          not bulk-loaded, so there's no Bronze/Silver step
+                                          for any of these three sources)
 ```
 
 ---
@@ -341,7 +358,10 @@ RockHound/
   - ✅ Elevation data (Open-Elevation API) — done, as a separate `get_elevation` tool
   - ✅ Vehicle-specific road access matching (OpenStreetMap track/road tags vs. a real vehicle profile in `Dim_Vehicle`) — done, as a separate `check_vehicle_access` tool
 
-All three original planning phases are now complete. Five governed MCP tools, real data end to end, verified against real ground-truth coordinates throughout.
+- **✅ Phase 4 (complete):**
+  - ✅ Fossil-yield potential (BLM PFYC live API) — done, as a separate `check_fossil_potential` tool, added directly from real personal interest (fossil collecting) rather than being part of the original three-phase plan
+
+All three original planning phases, plus a fourth added directly from real personal interest, are now complete. Eight governed MCP tools, real data end to end, verified against real ground-truth coordinates throughout.
 
 ---
 
@@ -356,6 +376,7 @@ Several honest caveats are already noted individually throughout this README (in
 - **No automated test suite.** Every tool and data-loading step in this project was verified through manual, interactive testing against known real-world ground truth (documented throughout "Real Engineering Challenges Solved" and "Example Output") rather than a formal unit/integration test framework.
 - **Advisory only, not a legal or safety authority.** `check_land_access` and `check_vehicle_access` in particular are meant to inform a decision, not replace verifying claim status, land access, and road conditions independently and in person before relying on them.
 - **`date_closed` on `Silver.Claims` is unreliable for the vast majority of records.** 244,515 of the ~288,000 historical closed claims share the exact same date (`1900-01-01`) -- a sentinel/placeholder value baked into the original BLM source data, not a real closure date. A working technique exists to get real closure dates and reasons for a small subset of *recently* closed claims (via a shared `SF_ID` join to a separate BLM action-history service -- confirmed live, but only covering roughly 1,171 of Colorado's closed claims), but no reliable date exists for the bulk of older historical closures through any source found so far.
+- **`check_fossil_potential`'s coverage is limited to BLM-administered land.** Confirmed directly: querying a real, well-known fossil locality on National Park Service land (Florissant Fossil Beds) returns no data at all, even though the underlying geology is extremely well studied -- PFYC is fundamentally a BLM system and its polygon coverage does not appear to extend into other agencies' land.
 
 ---
 
