@@ -312,6 +312,16 @@ def find_vacant_claims_near_location(latitude: float, longitude: float, radius_m
     For broader area context (nearest city, river, trailhead, hot springs) at the
     same coordinate, pair this with check_land_access.
 
+    Coordinate note: each claim's reported latitude/longitude is the center of its
+    bounding envelope (boundary.EnvelopeCenter()), not a survey-precise point --
+    since most lode claims are simple, roughly rectangular shapes, this lands
+    inside or very near the actual claim in nearly all cases, and is intended for
+    trip planning (e.g. plotting claims on a map before a prospecting visit), not
+    legal/survey purposes. Added directly from a real request: a user and a real
+    claim holder wanted to plot nearby vacant claims on a map to plan an actual
+    prospecting trip, and manually pulling coordinates via a one-off SQL query
+    each time wasn't sustainable.
+
     Performance design: applies the same two-phase, capped-then-enriched pattern
     already proven throughout this project from the start -- fast distance-only
     matching and capping first, then county enrichment only on the small final
@@ -325,7 +335,9 @@ def find_vacant_claims_near_location(latitude: float, longitude: float, radius_m
     cursor.execute("""
         DECLARE @searchPoint GEOGRAPHY = geography::Point(?, ?, 4326);
         SELECT TOP (500) claim_key, claim_name, is_recently_closed, date_closed,
-               boundary.STDistance(@searchPoint) / 1609.34 AS distance_miles
+               boundary.STDistance(@searchPoint) / 1609.34 AS distance_miles,
+               boundary.EnvelopeCenter().Lat AS claim_lat,
+               boundary.EnvelopeCenter().Long AS claim_lon
         FROM Silver.Claims
         WHERE is_vacant = 1
           AND boundary.STDistance(@searchPoint) < ?
@@ -359,8 +371,8 @@ def find_vacant_claims_near_location(latitude: float, longitude: float, radius_m
             recency_note = f" [CLOSED RECENTLY: {r.date_closed}]" if r.is_recently_closed else ""
             county = county_by_key.get(r.claim_key)
             county_note = f", {county} County" if county else ""
-            results.append(f"{r.claim_name}{county_note} - {r.distance_miles:.1f} mi away{recency_note}")
-        header = f"Showing closest {len(rows)} of {len(all_rows)} total vacant claims within {radius_miles} mi:\n" if len(all_rows) > max_results else f"Showing all {len(rows)} vacant claims within {radius_miles} mi:\n"
+            results.append(f"{r.claim_name}{county_note} - {r.distance_miles:.1f} mi away ({r.claim_lat:.6f}, {r.claim_lon:.6f}){recency_note}")
+        header = f"Showing closest {len(rows)} of {len(all_rows)} total vacant claims within {radius_miles} mi (coordinates are each claim's approximate center, for trip planning):\n" if len(all_rows) > max_results else f"Showing all {len(rows)} vacant claims within {radius_miles} mi (coordinates are each claim's approximate center, for trip planning):\n"
         claims_section = header + "\n".join(results) + "\n"
 
     cursor.execute("""
